@@ -28,7 +28,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -555,6 +555,7 @@ class Store:
                 "series_priority": True,
                 "playlist_enabled": True,
                 "playlist_tpl": "{TEN_TRUYEN} | Full tập",
+                "batch_n": 3,
             },
         )
         self.uploaded = load_json(UPLOADED_FILE, {})
@@ -825,15 +826,20 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(
             sch,
-            text="Giờ: YYYY-MM-DD HH:MM (VN)  |  Thumb: VIDEO.jpg / +Thumb.jpg  |  Tập: 'Tập 1'  |  Mất điện: video đã up vẫn hẹn giờ trên YT, mở lại bấm hàng loạt là tiếp",
+            text="Bấm chạy = UPLOAD NGAY (3 video hoặc hàng loạt). Giờ trong lịch = lúc YouTube tự PUBLIC. App có thể tắt sau khi up xong.",
             text_color="#888",
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
         act = ctk.CTkFrame(self)
         act.pack(fill="x", **pad)
-        ctk.CTkButton(act, text="Đăng 1 video", height=40, width=160,
+        ctk.CTkButton(act, text="Đăng 1 video", height=40, width=140,
                       command=lambda: self.start_job(1)).pack(side="left", padx=8, pady=10)
-        ctk.CTkButton(act, text="Chạy hàng loạt (hết thì dừng)", height=40, width=220,
+        ctk.CTkLabel(act, text="Up ngay:").pack(side="left")
+        self.batch_var = ctk.StringVar(value=str(self.store.cfg.get("batch_n", 3)))
+        ctk.CTkEntry(act, textvariable=self.batch_var, width=40).pack(side="left", padx=4)
+        ctk.CTkButton(act, text="Up N video ngay", height=40, width=140,
+                      fg_color="#1f6aa5", command=self.start_batch_n).pack(side="left", padx=4)
+        ctk.CTkButton(act, text="Hàng loạt hết", height=40, width=130,
                       fg_color="#1f6aa5", command=lambda: self.start_job(999)).pack(side="left", padx=8)
         ctk.CTkButton(act, text="Lưu cấu hình", height=40, width=130,
                       fg_color="#3d6b3d", command=self.save_ui).pack(side="left", padx=8)
@@ -1004,6 +1010,19 @@ class App(ctk.CTk):
         if ch.get("process_buffer_min") is not None:
             self.buffer_var.set(str(ch["process_buffer_min"]))
         self._write_slots(ch.get("schedule_slots") or [])
+        if ch.get("title_tpl"):
+            self.title_var.set(ch["title_tpl"])
+        if ch.get("desc_tpl"):
+            self.desc_box.delete("1.0", "end")
+            self.desc_box.insert("1.0", ch["desc_tpl"])
+        if ch.get("tags"):
+            self.tags_var.set(ch["tags"])
+        if ch.get("topic"):
+            self.topic_var.set(ch["topic"])
+        if ch.get("playlist_tpl"):
+            self.playlist_var.set(ch["playlist_tpl"])
+        if ch.get("batch_n") is not None:
+            self.batch_var.set(str(ch["batch_n"]))
         self.store.cfg["active_channel"] = cid
         self.on_scan()
 
@@ -1190,9 +1209,32 @@ class App(ctk.CTk):
             ch["schedule_slots"] = list(self.store.cfg.get("schedule_slots") or [])
             ch["interval_hours"] = self.store.cfg.get("interval_hours", 24)
             ch["process_buffer_min"] = self.store.cfg.get("process_buffer_min", 45)
+            ch["title_tpl"] = self.store.cfg.get("title_tpl", "")
+            ch["desc_tpl"] = self.store.cfg.get("desc_tpl", "")
+            ch["tags"] = self.store.cfg.get("tags", "")
+            ch["topic"] = self.store.cfg.get("topic", "")
+            ch["playlist_tpl"] = self.store.cfg.get("playlist_tpl", "")
+            ch["schedule_enabled"] = self.store.cfg.get("schedule_enabled", True)
+            ch["public_now"] = self.store.cfg.get("public_now", False)
+            ch["auto_thumb"] = self.store.cfg.get("auto_thumb", True)
+            ch["overlay_thumb_text"] = self.store.cfg.get("overlay_thumb_text", True)
+            ch["series_priority"] = self.store.cfg.get("series_priority", True)
+            ch["playlist_enabled"] = self.store.cfg.get("playlist_enabled", True)
+            try:
+                ch["batch_n"] = max(1, int(float(self.batch_var.get() or 3)))
+            except ValueError:
+                ch["batch_n"] = 3
+            self.store.cfg["batch_n"] = ch["batch_n"]
             self.store.cfg["active_channel"] = cid
         self.store.save()
         self._log_ui("Đã lưu cấu hình (kèm lịch kênh đang chọn).")
+
+    def start_batch_n(self):
+        try:
+            n = max(1, int(float(self.batch_var.get() or 3)))
+        except ValueError:
+            n = 3
+        self.start_job(n)
 
     def start_job(self, max_n: int):
         if not self._licensed:
@@ -1292,36 +1334,15 @@ class App(ctk.CTk):
                             "Điền giờ public, ví dụ:\n2026-09-09 12:00\nhoặc chỉ 12:00",
                         ))
                         break
-                    try:
-                        buf = int(self.store.cfg.get("process_buffer_min", 45))
-                    except (TypeError, ValueError):
-                        buf = 45
-                    buf = max(0, min(180, buf))
                     used = local.strftime("%Y-%m-%d %H:%M")
-                    upload_at = local - timedelta(minutes=buf)
                     self.store.cfg["next_publish"] = used
                     self.store.cfg["_slot_in_use"] = used
                     self.store.save()
                     self.after(0, lambda s=used: self.next_var.set(s))
                     publish_iso = to_rfc3339_utc(local, self.store.cfg.get("timezone", "Asia/Ho_Chi_Minh"))
-                    self.after(0, lambda t=title, pub=used, up=upload_at.strftime("%Y-%m-%d %H:%M"), b=buf:
-                               self._log_ui(
-                                   f"→ {t}\n"
-                                   f"   YouTube CÔNG CHIẾU ĐÚNG: {pub}\n"
-                                   f"   Tool UPLOAD lúc: {up} (trước {b} phút để kịp HD)"
-                               ))
-                    # chờ tới giờ upload = giờ chiếu - buffer
-                    while datetime.now() < upload_at:
-                        if self._cancel:
-                            break
-                        remain = int((upload_at - datetime.now()).total_seconds())
-                        self.after(0, lambda r=remain, pub=used: self.status_lbl.configure(
-                            text=f"Chờ upload {r//60}p{r%60:02d}s · chiếu {pub}"
-                        ))
-                        time.sleep(5)
-                    if self._cancel:
-                        self.after(0, lambda: self._log_ui("⏹ Hủy lúc đang chờ tới giờ upload."))
-                        break
+                    self.after(0, lambda t=title, pub=used: self._log_ui(
+                        f"→ UPLOAD NGAY: {t}\n   YouTube tự PUBLIC lúc: {pub}"
+                    ))
                 else:
                     self.after(0, lambda t=title: self._log_ui(f"→ Upload public ngay: {t}"))
 
