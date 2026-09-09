@@ -16,6 +16,7 @@ import random
 import re
 import sys
 import threading
+import time
 import traceback
 import urllib.request
 import zipfile
@@ -27,7 +28,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -212,6 +213,36 @@ def save_license(key: str) -> None:
     })
 
 
+def parse_user_datetime(text: str) -> datetime | None:
+    """Nhận nhiều kiểu giờ: 2026-09-09 12:00, 12:00, 12h, 12h00, 09/09/2026 12:00."""
+    s = (text or "").strip()
+    if not s:
+        return None
+    s = s.lower().replace("trưa", "").replace("sang", "").replace("sáng", "")
+    s = s.replace("chieu", "").replace("chiều", "").replace("toi", "").replace("tối", "")
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.replace("h", ":")
+    if s.endswith(":"):
+        s = s + "00"
+    # chỉ giờ: 12:00 / 12:00:00
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%d-%m-%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            t = datetime.strptime(s, fmt)
+            now = datetime.now()
+            dt = now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+            if dt <= now + timedelta(minutes=1):
+                dt += timedelta(days=1)
+            return dt
+        except ValueError:
+            pass
+    return None
+
+
 def story_name_from_file(path: Path) -> str:
     name = path.stem.strip()
     name = re.sub(r"^\s*\d+\s*[-._)]\s*", "", name)
@@ -303,14 +334,22 @@ def youtube_from_token(token_file: str):
     return build("youtube", "v3", credentials=creds)
 
 
+class JobCancelled(Exception):
+    pass
+
+
 def upload_video(youtube, file_path: Path, title: str, description: str, tags: list[str],
-                 category_id: str, made_for_kids: bool, publish_at_iso: str | None):
+                 category_id: str, made_for_kids: bool, publish_at_iso: str | None,
+                 should_cancel=None, notify_subscribers: bool = True):
     from googleapiclient.http import MediaFileUpload
 
     status = {"selfDeclaredMadeForKids": bool(made_for_kids)}
     if publish_at_iso:
+        # private đến đúng giờ → YouTube tự công chiếu
         status["privacyStatus"] = "private"
         status["publishAt"] = publish_at_iso
+        status["embeddable"] = True
+        status["publicStatsViewable"] = True
     else:
         status["privacyStatus"] = "public"
 
@@ -324,13 +363,50 @@ def upload_video(youtube, file_path: Path, title: str, description: str, tags: l
         "status": status,
     }
     media = MediaFileUpload(str(file_path), chunksize=8 * 1024 * 1024, resumable=True)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body=body,
+        media_body=media,
+        notifySubscribers=bool(notify_subscribers),
+    )
     response = None
     while response is None:
+        if should_cancel and should_cancel():
+            raise JobCancelled("Người dùng hủy job")
         status_u, response = request.next_chunk()
         if status_u:
             log(f"  upload {int(status_u.progress() * 100)}%")
     return response
+
+
+def setup_premiere_event(youtube, video_id: str, title: str, description: str, start_iso: str):
+    """
+    Cố gắng tạo buổi Công chiếu (liveBroadcast) đúng giờ.
+    YouTube Data API không có đủ nút Studio 'Đặt làm video Công chiếu'.
+    Nếu kênh chưa bật livestream, hàm này lỗi — video vẫn lịch công khai qua publishAt.
+    """
+    body = {
+        "snippet": {
+            "title": title[:100],
+            "description": (description or title)[:5000],
+            "scheduledStartTime": start_iso,
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+        "contentDetails": {
+            "enableAutoStart": True,
+            "enableAutoStop": True,
+            "enableDvr": True,
+            "recordFromStart": True,
+            "enableClosedCaptions": False,
+        },
+    }
+    return youtube.liveBroadcasts().insert(
+        part="snippet,status,contentDetails",
+        body=body,
+    ).execute()
 
 
 def find_thumb_for_video(video: Path) -> Path | None:
@@ -420,6 +496,30 @@ def set_thumbnail(youtube, video_id: str, image_path: Path):
     youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
 
 
+def ensure_playlist(youtube, title: str, description: str = "") -> str:
+    body = {
+        "snippet": {
+            "title": title[:150],
+            "description": (description or title)[:5000],
+        },
+        "status": {"privacyStatus": "public"},
+    }
+    resp = youtube.playlists().insert(part="snippet,status", body=body).execute()
+    return resp["id"]
+
+
+def add_video_to_playlist(youtube, playlist_id: str, video_id: str) -> None:
+    youtube.playlistItems().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "playlistId": playlist_id,
+                "resourceId": {"kind": "youtube#video", "videoId": video_id},
+            }
+        },
+    ).execute()
+
+
 def to_rfc3339_utc(local_dt: datetime, tz_name: str) -> str:
     import pytz
     tz = pytz.timezone(tz_name)
@@ -443,12 +543,18 @@ class Store:
                 "category_id": "24",
                 "made_for_kids": False,
                 "schedule_enabled": True,
+                "public_now": False,
+                "premiere_on": True,
                 "next_publish": "",
                 "interval_hours": 24,
+                "process_buffer_min": 45,
+                "schedule_slots": [],
                 "timezone": "Asia/Ho_Chi_Minh",
                 "auto_thumb": True,
                 "overlay_thumb_text": True,
                 "series_priority": True,
+                "playlist_enabled": True,
+                "playlist_tpl": "{TEN_TRUYEN} | Full tập",
             },
         )
         self.uploaded = load_json(UPLOADED_FILE, {})
@@ -547,6 +653,7 @@ class App(ctk.CTk):
         apply_window_icon(self)
         self.store = Store()
         self._busy = False
+        self._cancel = False
         self._licensed = False
         self._build()
         self.after(100, self._gate_license)
@@ -649,10 +756,18 @@ class App(ctk.CTk):
                      font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=8, pady=(8, 2))
         srow = ctk.CTkFrame(sch, fg_color="transparent")
         srow.pack(fill="x", padx=8, pady=4)
-        self.sched_on = ctk.CTkCheckBox(srow, text="Bật hẹn giờ (private + publishAt)")
+        self.sched_on = ctk.CTkCheckBox(srow, text="Hẹn giờ công chiếu")
         self.sched_on.pack(side="left")
         if self.store.cfg.get("schedule_enabled", True):
             self.sched_on.select()
+        self.public_now = ctk.CTkCheckBox(srow, text="Công chiếu ngay")
+        self.public_now.pack(side="left", padx=(10, 0))
+        if self.store.cfg.get("public_now", False):
+            self.public_now.select()
+        self.premiere_on = ctk.CTkCheckBox(srow, text="Đặt làm video Công chiếu")
+        self.premiere_on.pack(side="left", padx=(10, 0))
+        if self.store.cfg.get("premiere_on", True):
+            self.premiere_on.select()
         ctk.CTkLabel(srow, text="  Video kế tiếp:").pack(side="left", padx=(12, 4))
         nxt = self.store.cfg.get("next_publish") or datetime.now().strftime("%Y-%m-%d 22:00")
         self.next_var = ctk.StringVar(value=nxt)
@@ -660,6 +775,26 @@ class App(ctk.CTk):
         ctk.CTkLabel(srow, text="  Cách nhau (giờ):").pack(side="left", padx=(10, 4))
         self.interval_var = ctk.StringVar(value=str(self.store.cfg.get("interval_hours", 24)))
         ctk.CTkEntry(srow, textvariable=self.interval_var, width=50).pack(side="left")
+        ctk.CTkLabel(srow, text="  Chờ HD (phút):").pack(side="left", padx=(10, 4))
+        self.buffer_var = ctk.StringVar(value=str(self.store.cfg.get("process_buffer_min", 45)))
+        ctk.CTkEntry(srow, textvariable=self.buffer_var, width=46).pack(side="left")
+
+        slotrow = ctk.CTkFrame(sch, fg_color="transparent")
+        slotrow.pack(fill="x", padx=8, pady=(4, 2))
+        ctk.CTkLabel(slotrow, text="Lịch từng video (mỗi dòng 1 giờ, đúng giờ bạn chọn):").pack(anchor="w")
+        slbtn = ctk.CTkFrame(slotrow, fg_color="transparent")
+        slbtn.pack(fill="x", pady=(2, 2))
+        ctk.CTkButton(slbtn, text="Thêm 1 dòng", width=100, command=self._slot_add_one).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(slbtn, text="Thêm 5 dòng", width=100, command=self._slot_add_five).pack(side="left", padx=4)
+        ctk.CTkButton(slbtn, text="Xóa hết dòng", width=100, fg_color="#7a2d2d",
+                      command=self._slot_clear).pack(side="left", padx=4)
+        self.slot_box = ctk.CTkTextbox(slotrow, height=72)
+        self.slot_box.pack(fill="x")
+        saved_slots = self.store.cfg.get("schedule_slots") or []
+        if saved_slots:
+            self.slot_box.insert("1.0", "\n".join(saved_slots))
+        elif self.store.cfg.get("next_publish"):
+            self.slot_box.insert("1.0", self.store.cfg.get("next_publish"))
 
         trow = ctk.CTkFrame(sch, fg_color="transparent")
         trow.pack(fill="x", padx=8, pady=(0, 4))
@@ -675,9 +810,22 @@ class App(ctk.CTk):
         self.series_on.pack(side="left", padx=12)
         if self.store.cfg.get("series_priority", True):
             self.series_on.select()
+
+        prow = ctk.CTkFrame(sch, fg_color="transparent")
+        prow.pack(fill="x", padx=8, pady=(0, 4))
+        self.playlist_on = ctk.CTkCheckBox(prow, text="Tạo playlist khi là tập")
+        self.playlist_on.pack(side="left")
+        if self.store.cfg.get("playlist_enabled", True):
+            self.playlist_on.select()
+        ctk.CTkLabel(prow, text="  Tên list:").pack(side="left", padx=(10, 4))
+        self.playlist_var = ctk.StringVar(
+            value=self.store.cfg.get("playlist_tpl", "{TEN_TRUYEN} | Full tập")
+        )
+        ctk.CTkEntry(prow, textvariable=self.playlist_var, width=280).pack(side="left")
+
         ctk.CTkLabel(
             sch,
-            text="Giờ: YYYY-MM-DD HH:MM (VN)  |  Thumb: VIDEO.jpg / VIDEO+Thumb.jpg  |  Tập: 'Tập 1', 'Ep 02'…",
+            text="Giờ: YYYY-MM-DD HH:MM (VN)  |  Thumb: VIDEO.jpg / +Thumb.jpg  |  Tập: 'Tập 1'  |  Mất điện: video đã up vẫn hẹn giờ trên YT, mở lại bấm hàng loạt là tiếp",
             text_color="#888",
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
@@ -689,6 +837,11 @@ class App(ctk.CTk):
                       fg_color="#1f6aa5", command=lambda: self.start_job(999)).pack(side="left", padx=8)
         ctk.CTkButton(act, text="Lưu cấu hình", height=40, width=130,
                       fg_color="#3d6b3d", command=self.save_ui).pack(side="left", padx=8)
+        self.btn_cancel = ctk.CTkButton(
+            act, text="Hủy job", height=40, width=110,
+            fg_color="#8b1e1e", hover_color="#6d1616", command=self.cancel_job,
+        )
+        self.btn_cancel.pack(side="left", padx=8)
         self.status_lbl = ctk.CTkLabel(act, text="Sẵn sàng")
         self.status_lbl.pack(side="left", padx=12)
 
@@ -800,10 +953,21 @@ class App(ctk.CTk):
         threading.Thread(target=work, daemon=True).start()
 
     def current_channel_id(self) -> str | None:
-        val = self.ch_combo.get()
-        if "|" not in val:
+        val = (self.ch_combo.get() or "").strip()
+        if not val or val.startswith("(chưa"):
             return None
-        return val.split("|")[-1].strip()
+        # "mail · tên · UCxxxx" hoặc "tên | UCxxxx"
+        for sep in (" · ", " ·", "·", "|"):
+            if sep in val:
+                tail = val.split(sep)[-1].strip()
+                if tail.startswith("UC") or len(tail) >= 10:
+                    return tail
+        # fallback: so khớp với id đã lưu
+        chs = self.store.cfg.get("channels", {})
+        for cid in chs:
+            if cid in val:
+                return cid
+        return None
 
     def _channel_label(self, ch_id: str, meta: dict) -> str:
         """mail · tên kênh · UCxxxx — dễ phân biệt nhiều Gmail / nhiều kênh."""
@@ -832,6 +996,14 @@ class App(ctk.CTk):
             return
         ch = self.store.cfg["channels"].get(cid, {})
         self.folder_var.set(ch.get("folder", ""))
+        # lịch riêng từng kênh
+        if ch.get("next_publish"):
+            self.next_var.set(ch["next_publish"])
+        if ch.get("interval_hours") is not None:
+            self.interval_var.set(str(ch["interval_hours"]))
+        if ch.get("process_buffer_min") is not None:
+            self.buffer_var.set(str(ch["process_buffer_min"]))
+        self._write_slots(ch.get("schedule_slots") or [])
         self.store.cfg["active_channel"] = cid
         self.on_scan()
 
@@ -891,9 +1063,15 @@ class App(ctk.CTk):
             self.store.save()
         self.on_scan()
 
-    def pending_files(self) -> list[Path]:
-        cid = self.current_channel_id()
-        folder = Path(self.folder_var.get().strip()) if self.folder_var.get().strip() else None
+    def pending_files(self, cid: str | None = None) -> list[Path]:
+        cid = cid or self.current_channel_id()
+        folder = None
+        if cid and cid in self.store.cfg.get("channels", {}):
+            raw = self.store.cfg["channels"][cid].get("folder") or ""
+            if raw:
+                folder = Path(raw)
+        if folder is None and self.folder_var.get().strip():
+            folder = Path(self.folder_var.get().strip())
         if not folder or not folder.is_dir() or not cid:
             return []
         used = self.store.used_names(cid)
@@ -936,36 +1114,105 @@ class App(ctk.CTk):
         mode = "ưu tiên tập" if self.store.cfg.get("series_priority", True) else "random"
         self.status_lbl.configure(text=f"Còn {len(files)} video · mode: {mode}")
 
+    def _parse_slot_lines(self) -> list[str]:
+        raw = self.slot_box.get("1.0", "end").strip()
+        out = []
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            dt = parse_user_datetime(s)
+            if dt:
+                out.append(dt.strftime("%Y-%m-%d %H:%M"))
+        return out
+
+    def _write_slots(self, slots: list[str]):
+        self.slot_box.delete("1.0", "end")
+        if slots:
+            self.slot_box.insert("1.0", "\n".join(slots))
+
+    def _slot_add_one(self):
+        slots = self._parse_slot_lines()
+        try:
+            hrs = float(self.interval_var.get() or 24)
+        except ValueError:
+            hrs = 24
+        if slots:
+            last = datetime.strptime(slots[-1], "%Y-%m-%d %H:%M")
+        else:
+            last = parse_user_datetime(self.next_var.get().strip())
+            if last is None:
+                last = datetime.now().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            last = last - timedelta(hours=hrs)
+        nxt = last + timedelta(hours=hrs)
+        slots.append(nxt.strftime("%Y-%m-%d %H:%M"))
+        self._write_slots(slots)
+
+    def _slot_add_five(self):
+        for _ in range(5):
+            self._slot_add_one()
+
+    def _slot_clear(self):
+        self.slot_box.delete("1.0", "end")
+
     def save_ui(self):
         self.store.cfg["title_tpl"] = self.title_var.get()
         self.store.cfg["desc_tpl"] = self.desc_box.get("1.0", "end").strip()
         self.store.cfg["tags"] = self.tags_var.get()
         self.store.cfg["topic"] = self.topic_var.get()
         self.store.cfg["schedule_enabled"] = bool(self.sched_on.get())
+        self.store.cfg["public_now"] = bool(self.public_now.get())
+        self.store.cfg["premiere_on"] = bool(self.premiere_on.get())
         self.store.cfg["auto_thumb"] = bool(self.auto_thumb.get())
         self.store.cfg["overlay_thumb_text"] = bool(self.overlay_thumb.get())
         self.store.cfg["series_priority"] = bool(self.series_on.get())
+        self.store.cfg["playlist_enabled"] = bool(self.playlist_on.get())
+        self.store.cfg["playlist_tpl"] = self.playlist_var.get().strip() or "{TEN_TRUYEN} | Full tập"
         self.store.cfg["next_publish"] = self.next_var.get().strip()
+        self.store.cfg["schedule_slots"] = self._parse_slot_lines()
+        if self.store.cfg["schedule_slots"]:
+            self.store.cfg["next_publish"] = self.store.cfg["schedule_slots"][0]
+            self.next_var.set(self.store.cfg["next_publish"])
         try:
             self.store.cfg["interval_hours"] = float(self.interval_var.get())
         except ValueError:
             self.store.cfg["interval_hours"] = 24
+        try:
+            buf = int(float(self.buffer_var.get()))
+            self.store.cfg["process_buffer_min"] = max(30, min(120, buf))
+        except ValueError:
+            self.store.cfg["process_buffer_min"] = 45
         cid = self.current_channel_id()
         if cid and cid in self.store.cfg["channels"]:
-            self.store.cfg["channels"][cid]["folder"] = self.folder_var.get().strip()
+            ch = self.store.cfg["channels"][cid]
+            ch["folder"] = self.folder_var.get().strip()
+            ch["next_publish"] = self.store.cfg.get("next_publish", "")
+            ch["schedule_slots"] = list(self.store.cfg.get("schedule_slots") or [])
+            ch["interval_hours"] = self.store.cfg.get("interval_hours", 24)
+            ch["process_buffer_min"] = self.store.cfg.get("process_buffer_min", 45)
             self.store.cfg["active_channel"] = cid
         self.store.save()
-        self._log_ui("Đã lưu cấu hình.")
+        self._log_ui("Đã lưu cấu hình (kèm lịch kênh đang chọn).")
 
     def start_job(self, max_n: int):
         if not self._licensed:
             messagebox.showerror("License", "Chưa kích hoạt key.")
             return
-        if self._busy:
-            messagebox.showinfo("Đang chạy", "Đợi job hiện tại xong.")
-            return
         self.save_ui()
         cid = self.current_channel_id()
+        if self._busy:
+            q = self.store.cfg.setdefault("job_queue", [])
+            q.append({"cid": cid, "max_n": max_n})
+            self.store.save()
+            title = self.store.cfg["channels"].get(cid, {}).get("title", cid)
+            self._log_ui(f"📌 Đã xếp hàng đợi kênh: {title} (chạy sau job hiện tại)")
+            messagebox.showinfo(
+                "Hàng đợi",
+                f"Job kênh [{title}] đã lưu.\n"
+                "Đổi kênh / lên lịch kênh khác rồi bấm chạy để xếp tiếp.\n"
+                "App phải MỞ mới upload được. Đóng app = dừng chờ.",
+            )
+            return
         if not cid:
             messagebox.showerror("Thiếu kênh", "Kết nối / chọn kênh trước.")
             return
@@ -977,7 +1224,17 @@ class App(ctk.CTk):
             messagebox.showerror("Token", "Kênh chưa OAuth hoặc token mất. Kết nối lại.")
             return
         self._busy = True
+        self._cancel = False
+        self.after(0, lambda: self.status_lbl.configure(text="Đang chạy…"))
         threading.Thread(target=self._job, args=(cid, max_n), daemon=True).start()
+
+    def cancel_job(self):
+        if not self._busy:
+            messagebox.showinfo("Hủy", "Không có job đang chạy.")
+            return
+        self._cancel = True
+        self._log_ui("⏹ Đã gửi lệnh HỦY — đợi chunk upload hiện tại xong…")
+        self.status_lbl.configure(text="Đang hủy…")
 
     def _job(self, cid: str, max_n: int):
         try:
@@ -986,7 +1243,10 @@ class App(ctk.CTk):
             youtube = youtube_from_token(ch["token_file"])
             done = 0
             while done < max_n:
-                pending = self.pending_files()
+                if self._cancel:
+                    self.after(0, lambda: self._log_ui("⏹ Đã hủy job. Không đăng video tiếp."))
+                    break
+                pending = self.pending_files(cid)
                 if not pending:
                     self.after(0, lambda: self._log_ui("⛔ HẾT video chưa đăng. Tạm dừng."))
                     self.after(0, lambda: messagebox.showwarning("HẾT", "Hết truyện trong thư mục kênh này."))
@@ -1001,16 +1261,67 @@ class App(ctk.CTk):
                 tags = list(dict.fromkeys(tags + [ten]))
 
                 publish_iso = None
-                if self.store.cfg.get("schedule_enabled"):
+                if self.store.cfg.get("public_now"):
+                    self.after(0, lambda t=title: self._log_ui(f"→ Upload CÔNG CHIẾU NGAY: {t}"))
+                elif self.store.cfg.get("schedule_enabled"):
+                    slots = list(self.store.cfg.get("schedule_slots") or [])
+                    # ô Video kế tiếp cũng là giờ user chọn
+                    nxt = parse_user_datetime(self.store.cfg.get("next_publish") or "")
+                    if nxt:
+                        ns = nxt.strftime("%Y-%m-%d %H:%M")
+                        if ns not in slots:
+                            slots.insert(0, ns)
+                    local = None
+                    while slots:
+                        cand = parse_user_datetime(slots[0])
+                        if cand is None:
+                            slots.pop(0)
+                            continue
+                        if cand <= datetime.now() + timedelta(minutes=1):
+                            self.after(0, lambda s=slots[0]: self._log_ui(f"  ⚠ bỏ slot đã qua: {s}"))
+                            slots.pop(0)
+                            continue
+                        local = cand
+                        break
+                    if local is None:
+                        self.after(0, lambda: self._log_ui(
+                            "  ⚠ chưa có giờ hợp lệ. Ghi vào ô Video kế tiếp hoặc lịch: 2026-09-09 12:00"
+                        ))
+                        self.after(0, lambda: messagebox.showerror(
+                            "Thiếu giờ",
+                            "Điền giờ public, ví dụ:\n2026-09-09 12:00\nhoặc chỉ 12:00",
+                        ))
+                        break
                     try:
-                        local = datetime.strptime(self.store.cfg["next_publish"].strip(), "%Y-%m-%d %H:%M")
-                    except ValueError:
-                        local = datetime.now() + timedelta(hours=1)
-                    if local <= datetime.now():
-                        local = datetime.now() + timedelta(minutes=15)
+                        buf = int(self.store.cfg.get("process_buffer_min", 45))
+                    except (TypeError, ValueError):
+                        buf = 45
+                    buf = max(0, min(180, buf))
+                    used = local.strftime("%Y-%m-%d %H:%M")
+                    upload_at = local - timedelta(minutes=buf)
+                    self.store.cfg["next_publish"] = used
+                    self.store.cfg["_slot_in_use"] = used
+                    self.store.save()
+                    self.after(0, lambda s=used: self.next_var.set(s))
                     publish_iso = to_rfc3339_utc(local, self.store.cfg.get("timezone", "Asia/Ho_Chi_Minh"))
-                    self.after(0, lambda t=title, ts=self.store.cfg["next_publish"]:
-                               self._log_ui(f"→ Upload: {t}\n   hẹn giờ VN: {ts}"))
+                    self.after(0, lambda t=title, pub=used, up=upload_at.strftime("%Y-%m-%d %H:%M"), b=buf:
+                               self._log_ui(
+                                   f"→ {t}\n"
+                                   f"   YouTube CÔNG CHIẾU ĐÚNG: {pub}\n"
+                                   f"   Tool UPLOAD lúc: {up} (trước {b} phút để kịp HD)"
+                               ))
+                    # chờ tới giờ upload = giờ chiếu - buffer
+                    while datetime.now() < upload_at:
+                        if self._cancel:
+                            break
+                        remain = int((upload_at - datetime.now()).total_seconds())
+                        self.after(0, lambda r=remain, pub=used: self.status_lbl.configure(
+                            text=f"Chờ upload {r//60}p{r%60:02d}s · chiếu {pub}"
+                        ))
+                        time.sleep(5)
+                    if self._cancel:
+                        self.after(0, lambda: self._log_ui("⏹ Hủy lúc đang chờ tới giờ upload."))
+                        break
                 else:
                     self.after(0, lambda t=title: self._log_ui(f"→ Upload public ngay: {t}"))
 
@@ -1020,6 +1331,11 @@ class App(ctk.CTk):
                         self.store.cfg.get("category_id", "24"),
                         self.store.cfg.get("made_for_kids", False),
                         publish_iso,
+                        should_cancel=lambda: self._cancel,
+                        notify_subscribers=bool(
+                            self.store.cfg.get("premiere_on", True)
+                            or self.store.cfg.get("public_now")
+                        ),
                     )
                     vid = resp.get("id", "?")
                     if self.store.cfg.get("auto_thumb", True):
@@ -1038,20 +1354,54 @@ class App(ctk.CTk):
                             self.after(0, lambda: self._log_ui("  ⚠ không thấy file thumb cùng tên"))
                     self.store.mark_used(cid, pick.name)
                     self.after(0, lambda v=vid, n=pick.name: self._log_ui(f"✓ OK youtube.com/watch?v={v}  ({n})"))
-                    if self.store.cfg.get("schedule_enabled"):
-                        hrs = float(self.store.cfg.get("interval_hours", 24))
+                    if publish_iso and not self.store.cfg.get("public_now"):
+                        self.after(0, lambda: self._log_ui(
+                            "  ✓ Lên lịch công khai đúng giờ (như mục Lên lịch trên Studio)."
+                        ))
+                    # playlist cho video có số tập
+                    if self.store.cfg.get("playlist_enabled", True) and extract_episode(pick) is not None:
                         try:
-                            nxt = datetime.strptime(self.store.cfg["next_publish"].strip(), "%Y-%m-%d %H:%M")
-                        except ValueError:
-                            nxt = datetime.now()
-                        if nxt <= datetime.now():
-                            nxt = datetime.now()
-                        nxt = nxt + timedelta(hours=hrs)
-                        self.store.cfg["next_publish"] = nxt.strftime("%Y-%m-%d %H:%M")
+                            pl_title = self.store.cfg.get("playlist_tpl", "{TEN_TRUYEN} | Full tập").replace("{TEN_TRUYEN}", ten)
+                            chs = self.store.cfg.setdefault("channels", {})
+                            chm = chs.setdefault(cid, {})
+                            maps = chm.setdefault("playlists", {})
+                            key = ten.strip().lower()
+                            pid = maps.get(key)
+                            if not pid:
+                                pid = ensure_playlist(youtube, pl_title, f"Full tập: {ten}")
+                                maps[key] = pid
+                                self.store.save()
+                                self.after(0, lambda t=pl_title, i=pid: self._log_ui(f"  ✓ tạo playlist: {t} ({i})"))
+                            add_video_to_playlist(youtube, pid, vid)
+                            self.after(0, lambda: self._log_ui("  ✓ đã thêm video vào playlist"))
+                        except Exception as pe:
+                            self.after(0, lambda err=str(pe): self._log_ui(f"  ⚠ playlist: {err}"))
+                    if self.store.cfg.get("schedule_enabled"):
+                        used = self.store.cfg.get("_slot_in_use") or self.store.cfg.get("next_publish")
+                        slots = [s for s in (self.store.cfg.get("schedule_slots") or []) if s != used]
+                        # nếu user không soạn list, sinh slot tiếp theo = giờ vừa dùng + khoảng cách
+                        if not slots and used:
+                            try:
+                                hrs = float(self.store.cfg.get("interval_hours", 24))
+                            except ValueError:
+                                hrs = 24
+                            try:
+                                base = datetime.strptime(used, "%Y-%m-%d %H:%M")
+                                slots = [(base + timedelta(hours=hrs)).strftime("%Y-%m-%d %H:%M")]
+                            except ValueError:
+                                slots = []
+                        self.store.cfg["schedule_slots"] = slots
+                        self.store.cfg["next_publish"] = slots[0] if slots else ""
+                        self.store.cfg.pop("_slot_in_use", None)
                         self.store.save()
-                        self.after(0, lambda s=self.store.cfg["next_publish"]: self.next_var.set(s))
+                        self.after(0, lambda sl=list(slots): self._write_slots(sl))
+                        if slots:
+                            self.after(0, lambda s=slots[0]: self.next_var.set(s))
                     done += 1
                     self.after(0, self.on_scan)
+                except JobCancelled:
+                    self.after(0, lambda: self._log_ui("⏹ Đã hủy giữa lúc upload. Video này có thể chưa lên YouTube."))
+                    break
                 except Exception as e:
                     self.after(0, lambda err=str(e): self._log_ui(f"✗ Lỗi upload {pick.name}: {err}"))
                     break
@@ -1061,6 +1411,31 @@ class App(ctk.CTk):
         finally:
             self._busy = False
             self.after(0, lambda: self.status_lbl.configure(text="Xong / sẵn sàng"))
+            self.after(200, self._start_next_queued)
+
+    def _start_next_queued(self):
+        if self._busy:
+            return
+        q = self.store.cfg.get("job_queue") or []
+        if not q:
+            return
+        item = q.pop(0)
+        self.store.cfg["job_queue"] = q
+        self.store.save()
+        cid = item.get("cid")
+        max_n = int(item.get("max_n") or 999)
+        if not cid or cid not in self.store.cfg.get("channels", {}):
+            self._start_next_queued()
+            return
+        # nạp lịch kênh đó rồi chạy
+        labels = self.ch_combo.cget("values")
+        for lb in labels:
+            if cid in str(lb):
+                self.ch_combo.set(lb)
+                break
+        self.on_channel_pick()
+        self._log_ui(f"▶ Lấy job hàng đợi: {self.store.cfg['channels'][cid].get('title')}")
+        self.start_job(max_n)
 
 
 if __name__ == "__main__":
