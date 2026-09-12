@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -250,6 +250,30 @@ def save_json(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def http_open(req, timeout=20):
+    """Mở URL; máy Windows thiếu chứng chỉ thì fallback."""
+    import ssl
+    contexts = []
+    try:
+        import certifi
+        contexts.append(ssl.create_default_context(cafile=certifi.where()))
+    except Exception:
+        pass
+    try:
+        contexts.append(ssl.create_default_context())
+    except Exception:
+        pass
+    contexts.append(ssl._create_unverified_context())
+    last = None
+    for ctx in contexts:
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        except Exception as e:
+            last = e
+            continue
+    raise last or RuntimeError("Không kết nối được")
+
+
 def machine_id() -> str:
     raw = f"{platform.node()}|{platform.system()}|{platform.machine()}"
     try:
@@ -285,7 +309,7 @@ def banned_set() -> set[str]:
             BANNED_REMOTE,
             headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
         )
-        with urllib.request.urlopen(req, timeout=6) as r:
+        with http_open(req, timeout=6) as r:
             remote = json.loads(r.read().decode("utf-8", errors="replace"))
         ids = remote if isinstance(remote, list) else (remote.get("banned") or [])
         local |= {str(x).upper() for x in ids}
@@ -1106,8 +1130,8 @@ class App(ctk.CTk):
         self._busy = False
         self._cancel = False
         self._licensed = False
-        self._cfg_lock = threading.Lock()
-        self._slot_lock = threading.Lock()
+        self._cfg_lock = threading.RLock()
+        self._slot_lock = threading.RLock()
         self._ui_cid = None
         self._auto_tick_day = datetime.now().strftime("%Y-%m-%d")
         self._build()
@@ -1794,7 +1818,7 @@ class App(ctk.CTk):
                     GITHUB_RELEASES_API,
                     headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}", "Accept": "application/vnd.github+json"},
                 )
-                with urllib.request.urlopen(req, timeout=20) as r:
+                with http_open(req, timeout=20) as r:
                     data = json.loads(r.read().decode())
                 tag = (data.get("tag_name") or "").lstrip("vV").strip()
                 if not tag:
@@ -1833,7 +1857,15 @@ class App(ctk.CTk):
                 self.after(0, lambda: self._log_ui(f"Tải {exe_name} v{tag}…"))
                 dest = ROOT / exe_name
                 tmp = ROOT / (exe_name + ".download")
-                urllib.request.urlretrieve(exe_url, tmp)
+                dl = urllib.request.Request(
+                    exe_url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+                )
+                with http_open(dl, timeout=120) as r, open(tmp, "wb") as f:
+                    while True:
+                        chunk = r.read(1024 * 256)
+                        if not chunk:
+                            break
+                        f.write(chunk)
                 # nếu đang chạy chính file exe này thì chỉ tải cạnh với tên mới
                 try:
                     if dest.exists():
@@ -2242,9 +2274,8 @@ class App(ctk.CTk):
                 used.add(dt.strftime("%Y-%m-%d %H:%M"))
             else:
                 used.add(str(s).strip())
-        cur = self.store.cfg.get("_slot_in_use")
-        if cur:
-            used.add(str(cur).strip())
+        # v1.0.6: chỉ mốc upload THÀNH CÔNG mới nằm trong used_publish_slots.
+        # Mốc đang upload được giữ riêng trong inflight_uploads, không được tính là đã đăng.
         return used
 
     def _save_used_slots(self, used: set[str], cid: str | None = None):
@@ -2287,7 +2318,7 @@ class App(ctk.CTk):
         daily = self._parse_slot_lines()
         if not daily:
             return []
-        used = self._used_slot_set()
+        used = self._used_slot_set() | self._reserved_slot_set()
         now = datetime.now() + timedelta(minutes=1)
         day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         out: list[str] = []
@@ -2444,6 +2475,7 @@ class App(ctk.CTk):
     def _resume_after_reboot(self):
         if not self._licensed:
             return
+        self._recover_inflight_uploads()
         self._refresh_resume_btn()
         pending = self.store.cfg.get("pending_job") or {}
         n = int(pending.get("max_n") or 0)
@@ -2589,6 +2621,159 @@ class App(ctk.CTk):
     def save_ui(self):
         self._apply_ui_to_store(silent=False)
         self._write_slots(self.store.cfg.get("schedule_slots") or [])
+
+    # ---------- v1.0.6: checkpoint chống mất điện ----------
+    def _inflight_entries(self, cid: str | None = None) -> dict:
+        root = self.store.cfg.setdefault("inflight_uploads", {})
+        if cid is None:
+            return root
+        return root.setdefault(cid, {})
+
+    def _reserved_slot_set(self, cid: str | None = None) -> set[str]:
+        cid = cid or self.current_channel_id()
+        if not cid:
+            return set()
+        out: set[str] = set()
+        for row in self._inflight_entries(cid).values():
+            if isinstance(row, dict) and row.get("slot") and row.get("state") != "done":
+                out.add(str(row["slot"]).strip())
+        return out
+
+    def _checkpoint_upload(self, cid: str, pick: Path, slot: str | None,
+                           title: str, state: str = "uploading", video_id: str = ""):
+        with self._cfg_lock:
+            rows = self._inflight_entries(cid)
+            rows[pick.name] = {
+                "file": pick.name,
+                "slot": slot or "",
+                "title": title,
+                "state": state,
+                "video_id": video_id or "",
+                "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self.store.save()
+        self.after(0, self._refresh_slot_preview)
+
+    def _checkpoint_set_video_id(self, cid: str, pick: Path, video_id: str):
+        with self._cfg_lock:
+            rows = self._inflight_entries(cid)
+            row = rows.get(pick.name) or {"file": pick.name}
+            row["video_id"] = video_id or ""
+            row["state"] = "uploaded"
+            row["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            rows[pick.name] = row
+            self.store.save()
+
+    def _commit_upload_checkpoint(self, cid: str, pick: Path, slot: str | None):
+        """Chỉ gọi sau khi YouTube đã trả video_id: mốc lúc này mới được tính đã đăng."""
+        with self._cfg_lock:
+            if slot:
+                used = self._used_slot_set()
+                used.add(slot)
+                self._save_used_slots(used, cid)
+            rows = self._inflight_entries(cid)
+            rows.pop(pick.name, None)
+            if not rows:
+                self.store.cfg.get("inflight_uploads", {}).pop(cid, None)
+            self.store.save()
+        self.after(0, self._refresh_slot_preview)
+
+    def _release_upload_checkpoint(self, cid: str, pick_name: str):
+        """Upload lỗi/hủy: trả mốc về hàng chờ và không tính là đã đăng."""
+        with self._cfg_lock:
+            rows = self._inflight_entries(cid)
+            rows.pop(pick_name, None)
+            if not rows:
+                self.store.cfg.get("inflight_uploads", {}).pop(cid, None)
+            self.store.save()
+        self.after(0, self._refresh_slot_preview)
+
+    def _yt_video_exists(self, youtube, video_id: str) -> bool:
+        if not video_id:
+            return False
+        try:
+            r = youtube.videos().list(part="id,status,snippet", id=video_id).execute()
+            return bool(r.get("items"))
+        except Exception:
+            return False
+
+    def _yt_find_recent_title(self, youtube, title: str) -> str:
+        """Tìm video gần đây của chính kênh theo tiêu đề để tránh up trùng sau mất điện."""
+        if not title:
+            return ""
+        try:
+            r = youtube.search().list(
+                part="snippet", forMine=True, type="video", order="date",
+                maxResults=25, q=title[:100]
+            ).execute()
+            want = re.sub(r"\\s+", " ", title).strip().casefold()
+            for it in r.get("items", []):
+                got = re.sub(r"\\s+", " ", (it.get("snippet", {}).get("title") or "")).strip().casefold()
+                vid = (it.get("id") or {}).get("videoId") or ""
+                if vid and got == want:
+                    return vid
+        except Exception:
+            pass
+        return ""
+
+    def _recover_inflight_uploads(self):
+        """Khôi phục checkpoint sau mất điện. Không biến reservation thành 'đã up' nếu chưa xác minh."""
+        root = self.store.cfg.get("inflight_uploads") or {}
+        if not isinstance(root, dict) or not root:
+            return
+        recovered = 0
+        released = 0
+        recovered_by_cid: dict[str, int] = {}
+        for cid, rows in list(root.items()):
+            ch = self.store.cfg.get("channels", {}).get(cid) or {}
+            token = ch.get("token_file", "")
+            if not token or not Path(token).exists() or not isinstance(rows, dict):
+                continue
+            try:
+                youtube = youtube_from_token(token)
+            except Exception:
+                continue
+            for fname, row in list(rows.items()):
+                if not isinstance(row, dict):
+                    self._release_upload_checkpoint(cid, fname)
+                    released += 1
+                    continue
+                slot = str(row.get("slot") or "")
+                title = str(row.get("title") or "")
+                vid = str(row.get("video_id") or "")
+                exists = self._yt_video_exists(youtube, vid)
+                if not exists:
+                    vid = self._yt_find_recent_title(youtube, title)
+                    exists = bool(vid)
+                if exists:
+                    folder = ch.get("folder") or ""
+                    pick = Path(folder) / fname if folder else Path(fname)
+                    with self._cfg_lock:
+                        self.store.mark_used(cid, fname)
+                    self._commit_upload_checkpoint(cid, pick, slot or None)
+                    history_add({
+                        "when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "cid": cid, "file": fname, "title": title,
+                        "video_id": vid, "slot": slot, "recovered": True,
+                    })
+                    recovered += 1
+                    recovered_by_cid[cid] = recovered_by_cid.get(cid, 0) + 1
+                    self._log_ui(f"⚡ Khôi phục sau mất điện: đã xác minh {fname} trên YouTube ({vid}).")
+                else:
+                    # Không có video đã hoàn tất trên API => trả mốc, để job dở upload lại.
+                    self._release_upload_checkpoint(cid, fname)
+                    released += 1
+                    self._log_ui(f"↩ Khôi phục sau mất điện: {fname} chưa hoàn tất — trả mốc về hàng chờ.")
+        # Video đã xác minh sau reboot phải được trừ khỏi pending_job,
+        # nếu không nút Tiếp tục sẽ up dư thêm video mới.
+        for rcid, n_ok in recovered_by_cid.items():
+            chp = self.store.cfg.get("channels", {}).get(rcid, {}).get("pending_job") or {}
+            gp = self.store.cfg.get("pending_job") or {}
+            cur = int(chp.get("max_n") or (gp.get("max_n") if gp.get("cid") == rcid else 0) or 0)
+            if cur > 0:
+                self._persist_pending_job(rcid, max(0, cur - n_ok))
+        if recovered or released:
+            self._log_ui(f"⚡ Recovery v1.0.6: xác minh {recovered} video, trả lại {released} mốc.")
 
     def _today_up_count(self) -> int:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -2760,12 +2945,11 @@ class App(ctk.CTk):
                 if s not in seen:
                     uniq.append(s)
                     seen.add(s)
-            locked = self._used_slot_set()
-            for s in uniq:
-                locked.add(s)
-            self._save_used_slots(locked, cid)
+            # v1.0.6: KHÔNG ghi vào used_publish_slots ở bước lập kế hoạch.
+            # Mỗi file chỉ được giữ mốc tạm khi thread thực sự bắt đầu upload;
+            # mốc chỉ chuyển sang used_publish_slots sau khi YouTube trả video_id.
             self.after(0, lambda sl=list(uniq), d=list(daily): self._log_ui(
-                f"  Khóa {len(sl)} mốc theo giờ {', '.join(d)} → {', '.join(sl)}"
+                f"  Giữ tạm {len(sl)} mốc theo giờ {', '.join(d)} → {', '.join(sl)}"
             ))
             return uniq
 
@@ -2848,6 +3032,7 @@ class App(ctk.CTk):
                 self.after(0, lambda t=title, s=slot: self._log_ui(
                     f"→ UPLOAD SONG SONG: {t}\n   YouTube PUBLIC lúc: {s}"
                 ))
+            self._checkpoint_upload(cid, pick, slot, title, state="uploading")
             resp = upload_video(
                 youtube, pick, title, desc, tags,
                 self.store.cfg.get("category_id", "24"),
@@ -2860,6 +3045,7 @@ class App(ctk.CTk):
                 ),
             )
             vid = resp.get("id", "?")
+            self._checkpoint_set_video_id(cid, pick, vid)
             if self.store.cfg.get("auto_thumb", True):
                 th = find_thumb_for_video(pick)
                 if th:
@@ -2873,6 +3059,7 @@ class App(ctk.CTk):
             with self._cfg_lock:
                 self.store.mark_used(cid, pick.name)
             self._maybe_delete_after_up(pick)
+            self._commit_upload_checkpoint(cid, pick, slot)
             self.after(0, lambda v=vid, n=pick.name: self._log_ui(
                 f"✓ OK youtube.com/watch?v={v}  ({n})"
             ))
@@ -2928,17 +3115,12 @@ class App(ctk.CTk):
                     self.after(0, lambda t=pl_title: self._log_ui(f"  ✓ playlist series: {t}"))
                 except Exception:
                     pass
-            done_holder["n"] = done_holder.get("n", 0) + 1
+            with self._cfg_lock:
+                done_holder["n"] = done_holder.get("n", 0) + 1
         except JobCancelled:
-            if slot:
-                locked = self._used_slot_set()
-                locked.discard(slot)
-                self._save_used_slots(locked, cid)
+            self._release_upload_checkpoint(cid, pick.name)
         except Exception as e:
-            if slot:
-                locked = self._used_slot_set()
-                locked.discard(slot)
-                self._save_used_slots(locked, cid)
+            self._release_upload_checkpoint(cid, pick.name)
             self.after(0, lambda err=classify_yt_error(e): self._log_ui(f"✗ Lỗi {pick.name}: {err}"))
 
     def _job(self, cid: str, max_n: int):
@@ -2990,10 +3172,9 @@ class App(ctk.CTk):
                         self.after(0, lambda: messagebox.showerror("Lịch", "Không còn mốc giờ trống."))
                         break
                     used = nxt_list[0]
-                    locked = self._used_slot_set()
-                    locked.add(used)
                     self.store.cfg["_slot_in_use"] = used
-                    self._save_used_slots(locked, cid)
+                    # v1.0.6: đây chỉ là reservation tạm; chưa tính vào used_publish_slots.
+                    self._checkpoint_upload(cid, pick, used, title, state="uploading")
                     self.after(0, self._refresh_slot_preview)
                     local = datetime.strptime(used, "%Y-%m-%d %H:%M")
                     publish_iso = to_rfc3339_utc(local, self.store.cfg.get("timezone", "Asia/Ho_Chi_Minh"))
@@ -3003,6 +3184,8 @@ class App(ctk.CTk):
                 else:
                     self.after(0, lambda t=title: self._log_ui(f"→ Upload public ngay: {t}"))
 
+                if not self.store.cfg.get("schedule_enabled") or self.store.cfg.get("public_now"):
+                    self._checkpoint_upload(cid, pick, None, title, state="uploading")
                 try:
                     resp = upload_video(
                         youtube, pick, title, desc, tags,
@@ -3016,6 +3199,7 @@ class App(ctk.CTk):
                         ),
                     )
                     vid = resp.get("id", "?")
+                    self._checkpoint_set_video_id(cid, pick, vid)
                     if self.store.cfg.get("auto_thumb", True):
                         th = find_thumb_for_video(pick)
                         if th:
@@ -3032,6 +3216,8 @@ class App(ctk.CTk):
                             self.after(0, lambda: self._log_ui("  ⚠ không thấy file thumb cùng tên"))
                     self.store.mark_used(cid, pick.name)
                     self._maybe_delete_after_up(pick)
+                    committed_slot = self.store.cfg.get("_slot_in_use") or None
+                    self._commit_upload_checkpoint(cid, pick, committed_slot)
                     self.after(0, lambda v=vid, n=pick.name: self._log_ui(f"✓ OK youtube.com/watch?v={v}  ({n})"))
                     history_add({
                         "when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3113,28 +3299,18 @@ class App(ctk.CTk):
                         self._clear_pending_job()
                     self.after(0, self.on_scan)
                 except JobCancelled:
-                    used = self.store.cfg.pop("_slot_in_use", None)
-                    if used:
-                        locked = self._used_slot_set()
-                        locked.discard(used)
-                        self._save_used_slots(locked, cid)
-                        self.after(0, self._refresh_slot_preview)
-                    self.after(0, lambda: self._log_ui("⏹ Đã hủy giữa lúc upload. Video này có thể chưa lên YouTube."))
+                    self.store.cfg.pop("_slot_in_use", None)
+                    self._release_upload_checkpoint(cid, pick.name)
+                    self.after(0, lambda: self._log_ui("⏹ Đã hủy giữa lúc upload. Video chưa được tính là đã đăng."))
                     break
                 except Exception as e:
-                    used = self.store.cfg.pop("_slot_in_use", None)
-                    if used:
-                        locked = self._used_slot_set()
-                        locked.discard(used)
-                        self._save_used_slots(locked, cid)
-                        self.after(0, self._refresh_slot_preview)
+                    self.store.cfg.pop("_slot_in_use", None)
+                    self._release_upload_checkpoint(cid, pick.name)
                     self.after(0, lambda err=str(e): self._log_ui(f"✗ Lỗi upload {pick.name}: {err}"))
-                    # không dừng cả lô — thử video kế
-                    done += 1
-                    remain = max_n - done
-                    if remain > 0:
-                        self._persist_pending_job(cid, remain)
-                    continue
+                    # v1.0.6: upload lỗi KHÔNG tăng done, KHÔNG trừ pending_job.
+                    # Dừng lô để tránh vòng lặp vô hạn trên chính file lỗi; bấm Tiếp tục để thử lại.
+                    self._persist_pending_job(cid, max_n - done)
+                    break
         except Exception as e:
             tb = traceback.format_exc()
             self.after(0, lambda: self._log_ui(f"Lỗi job: {e}\n{tb}"))
