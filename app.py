@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.8"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -119,6 +119,8 @@ TOKENS_DIR = DATA / "tokens"
 TOKENS_DIR.mkdir(exist_ok=True)
 LOG_FILE = DATA / "log.txt"
 HISTORY_FILE = DATA / "history.json"
+CHANNEL_STATUS_FILE = DATA / "channel_status.json"
+JOBS_FILE = DATA / "jobs.json"
 THUMB_TMP = DATA / "thumb_tmp"
 THUMB_TMP.mkdir(exist_ok=True)
 
@@ -1025,6 +1027,7 @@ class Store:
                 "playlist_enabled": True,
                 "playlist_tpl": "{TEN_VIDEO} | Full tập",
                 "batch_n": 3,
+                "channel_status": {},
             },
         )
         self.uploaded = load_json(UPLOADED_FILE, {})
@@ -1046,6 +1049,24 @@ class Store:
         lst = list(self.uploaded.get(ch_id, []))
         self.uploaded[ch_id] = [x for x in lst if x != filename]
         self.save()
+
+    def set_channel_status(self, ch_id: str, status: str, count: int | None = None):
+        day = datetime.now().strftime("%Y-%m-%d")
+        self.cfg.setdefault("channel_status", {})
+        self.cfg["channel_status"].setdefault(ch_id, {})
+        self.cfg["channel_status"][ch_id].update({
+            "status": status,
+            "date": day,
+        })
+        if count is not None:
+            self.cfg["channel_status"][ch_id]["count"] = count
+        self.save()
+
+    def get_channel_status(self, ch_id: str):
+        row = self.cfg.get("channel_status", {}).get(ch_id, {})
+        if row.get("date") != datetime.now().strftime("%Y-%m-%d"):
+            return {"status": "white", "count": 0}
+        return row
 
 
 ctk.set_appearance_mode("dark")
@@ -1134,8 +1155,13 @@ class App(ctk.CTk):
         self._slot_lock = threading.RLock()
         self._ui_cid = None
         self._auto_tick_day = datetime.now().strftime("%Y-%m-%d")
+        # Multi-channel workers — không phụ thuộc combobox
+        self._workers = {}          # cid -> dict status
+        self._cancel_map = {}       # cid -> bool
+        self._busy_map = {}         # cid -> bool
         self._build()
         self.after(100, self._gate_license)
+        self.after(800, self._recover_workers)
 
     def _gate_license(self):
         lic = load_json(LICENSE_FILE, {})
@@ -1181,7 +1207,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(title_box, text=APP_NAME,
                      font=ctk.CTkFont(size=22, weight="bold"),
                      text_color="#ff4da6").pack(anchor="w")
-        ctk.CTkLabel(title_box, text=f"Auto Upload YouTube  ·  v{APP_VERSION}",
+        ctk.CTkLabel(title_box, text=f"Multi Channel Manager  ·  v{APP_VERSION}",
                      text_color="#aaa").pack(anchor="w")
         ctk.CTkButton(head, text="Cập nhật GitHub", width=130, height=32,
                       fg_color="#4a148c", hover_color="#6a1b9a",
@@ -1447,12 +1473,26 @@ class App(ctk.CTk):
         self.dash_last.pack(fill="x", padx=10, pady=(1, 8))
         self.after(600, self._refresh_dash)
 
-        right.grid_rowconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
+        right.grid_rowconfigure(0, weight=2)
+        right.grid_rowconfigure(1, weight=2)
+        right.grid_rowconfigure(2, weight=2)
         right.grid_columnconfigure(0, weight=1)
 
+        mgr = ctk.CTkFrame(right, fg_color="#1c1c24")
+        mgr.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        mhead = ctk.CTkFrame(mgr, fg_color="transparent")
+        mhead.pack(fill="x", padx=8, pady=(6, 2))
+        ctk.CTkLabel(
+            mhead, text="CHANNEL MANAGER",
+            font=ctk.CTkFont(size=13, weight="bold"), text_color="#ff4da6",
+        ).pack(side="left")
+        ctk.CTkButton(mhead, text="Làm mới", width=80, height=24,
+                      command=self._refresh_manager).pack(side="left", padx=8)
+        self.mgr_box = ctk.CTkTextbox(mgr, height=140, font=ctk.CTkFont(family="Consolas", size=13))
+        self.mgr_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
         files_panel = ctk.CTkFrame(right, fg_color="#1c1c24")
-        files_panel.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        files_panel.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 4))
         lhead = ctk.CTkFrame(files_panel, fg_color="transparent")
         lhead.pack(fill="x", padx=8, pady=(6, 2))
         ctk.CTkLabel(lhead, text="FILE CHƯA ĐĂNG", font=ctk.CTkFont(size=13, weight="bold"),
@@ -1461,7 +1501,7 @@ class App(ctk.CTk):
         self.file_list.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
         log_panel = ctk.CTkFrame(right, fg_color="#1c1c24")
-        log_panel.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        log_panel.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 8))
         rhead = ctk.CTkFrame(log_panel, fg_color="transparent")
         rhead.pack(fill="x", padx=8, pady=(6, 2))
         ctk.CTkLabel(rhead, text="NHẬT KÝ", font=ctk.CTkFont(size=13, weight="bold"),
@@ -1518,6 +1558,127 @@ class App(ctk.CTk):
                 self.logbox.see("end")
         except Exception:
             pass
+
+    def _worker(self, cid: str) -> dict:
+        w = self._workers.get(cid)
+        if not w:
+            ch = (self.store.cfg.get("channels") or {}).get(cid) or {}
+            w = {
+                "channel_id": cid,
+                "name": ch.get("title") or cid[-8:],
+                "status": "idle",
+                "current_video": "",
+                "progress": 0,
+                "uploaded_today": 0,
+                "last_error": "",
+            }
+            self._workers[cid] = w
+        return w
+
+    def _set_worker(self, cid: str, **kw):
+        w = self._worker(cid)
+        w.update(kw)
+        try:
+            save_json(CHANNEL_STATUS_FILE, self._workers)
+        except Exception:
+            pass
+        self.after(0, self._refresh_manager)
+
+    def _channel_busy(self, cid: str) -> bool:
+        return bool(self._busy_map.get(cid))
+
+    def _want_cancel(self, cid: str | None = None) -> bool:
+        if self._cancel:
+            return True
+        if cid and self._cancel_map.get(cid):
+            return True
+        return False
+
+    def _refresh_manager(self):
+        if not hasattr(self, "mgr_box"):
+            return
+        try:
+            self.mgr_box.delete("1.0", "end")
+        except Exception:
+            return
+        chs = self.store.cfg.get("channels") or {}
+        if not chs:
+            self.mgr_box.insert("end", "(chưa có kênh)\n")
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        lines = []
+        for cid, meta in chs.items():
+            w = self._worker(cid)
+            w["name"] = meta.get("title") or w.get("name") or cid
+            # uploaded today from history
+            n_today = 0
+            try:
+                for h in load_json(HISTORY_FILE, []) or []:
+                    if not isinstance(h, dict):
+                        continue
+                    if h.get("cid") == cid and str(h.get("when") or "").startswith(today):
+                        n_today += 1
+            except Exception:
+                n_today = int(w.get("uploaded_today") or 0)
+            w["uploaded_today"] = n_today
+            target = len(meta.get("schedule_slots") or []) or 0
+            st = w.get("status") or "idle"
+            err = (w.get("last_error") or "").strip()
+            token = meta.get("token_file") or ""
+            if token and not Path(token).exists():
+                st = "error"
+                err = err or "Token lỗi"
+            if st == "uploading":
+                mark = "🟡"
+                extra = f"Đang tải: {w.get('current_video') or '...'}"
+                if w.get("progress"):
+                    extra += f"  {int(w.get('progress') or 0)}%"
+            elif st == "error" or err:
+                mark = "🔴"
+                extra = err or "Lỗi"
+            elif target and n_today >= target:
+                mark = "🟢"
+                extra = f"Hôm nay: {n_today}/{target} video"
+                st = "done"
+            else:
+                mark = "⚪"
+                extra = f"Chưa chạy hôm nay" if n_today == 0 else f"Hôm nay: {n_today}/{target or '?'}"
+            title = meta.get("title") or cid[-8:]
+            lines.append(f"{mark} {title}\n   {extra}\n")
+        self.mgr_box.insert("end", "\n".join(lines) if lines else "(trống)\n")
+
+    def _recover_workers(self):
+        saved = load_json(CHANNEL_STATUS_FILE, {})
+        if isinstance(saved, dict):
+            for cid, w in saved.items():
+                if isinstance(w, dict):
+                    if w.get("status") == "uploading":
+                        w["status"] = "idle"
+                        w["current_video"] = ""
+                        w["last_error"] = ""
+                    self._workers[cid] = w
+        jobs = load_json(JOBS_FILE, [])
+        if isinstance(jobs, list):
+            pending = [j for j in jobs if isinstance(j, dict) and j.get("status") in ("uploading", "pending")]
+            if pending:
+                self._log_ui(f"⏯ Recovery: {len(pending)} job dở — đánh dấu pending, bấm chạy kênh để tiếp.")
+                for j in pending:
+                    j["status"] = "pending"
+                save_json(JOBS_FILE, jobs)
+        self._refresh_manager()
+
+    def start_job_for(self, cid: str, max_n: int, parallel: bool = False, skip_today_warn: bool = True):
+        """Chạy job đúng channel_id — không đọc combobox."""
+        if not cid or cid not in (self.store.cfg.get("channels") or {}):
+            return
+        old = self.store.cfg.get("active_channel")
+        # tạm set active chỉ để tái dùng validate; worker vẫn nhận cid
+        self.store.cfg["active_channel"] = cid
+        try:
+            self.start_job(max_n, skip_today_warn=skip_today_warn, parallel=parallel, force_cid=cid)
+        finally:
+            if old:
+                self.store.cfg["active_channel"] = old
 
     def _clear_log(self):
         try:
@@ -2811,12 +2972,13 @@ class App(ctk.CTk):
         )
         self.start_job(len(left), parallel=len(left) > 1)
 
-    def start_job(self, max_n: int, skip_today_warn: bool = False, parallel: bool = False):
+    def start_job(self, max_n: int, skip_today_warn: bool = False, parallel: bool = False, force_cid: str | None = None):
         if not self._licensed:
             messagebox.showerror("License", "Chưa kích hoạt key.")
             return
-        self._apply_ui_to_store(silent=True)
-        cid = self.current_channel_id()
+        if not force_cid:
+            self._apply_ui_to_store(silent=True)
+        cid = force_cid or self.current_channel_id()
         daily_n = len(self._parse_slot_lines()) or 1
         today_n = self._today_up_count()
         if (not skip_today_warn) and daily_n > 0 and today_n >= daily_n:
@@ -2834,18 +2996,12 @@ class App(ctk.CTk):
                 )
                 return
             self._log_ui(f"▶ Bạn chọn UP TIẾP (hôm nay đã {today_n}/{daily_n}).")
-        if self._busy:
+        if self._channel_busy(cid):
             q = self.store.cfg.setdefault("job_queue", [])
             q.append({"cid": cid, "max_n": max_n})
             self.store.save()
             title = self.store.cfg["channels"].get(cid, {}).get("title", cid)
-            self._log_ui(f"📌 Đã xếp hàng đợi kênh: {title} (chạy sau job hiện tại)")
-            messagebox.showinfo(
-                "Hàng đợi",
-                f"Job kênh [{title}] đã lưu.\n"
-                "Đổi kênh / lên lịch kênh khác rồi bấm chạy để xếp tiếp.\n"
-                "App phải MỞ mới upload được. Đóng app = dừng chờ.",
-            )
+            self._log_ui(f"📌 Kênh [{title}] đang chạy — xếp thêm vào hàng đợi CỦA KÊNH NÀY.")
             return
         if not cid:
             messagebox.showerror("Thiếu kênh", "Kết nối / chọn kênh trước.")
@@ -2899,19 +3055,32 @@ class App(ctk.CTk):
             if not ok:
                 return
         self._busy = True
+        self._busy_map[cid] = True
+        self._cancel_map[cid] = False
         self._cancel = False
         self._persist_pending_job(cid, max_n)
-        self.after(0, lambda: self.status_lbl.configure(text="Đang chạy…"))
+        self._set_worker(cid, status="uploading", current_video="bắt đầu…", last_error="", progress=0)
+        self.after(0, lambda: self.status_lbl.configure(text="Đang chạy nền…"))
         target = self._job_parallel if (parallel and max_n > 1) else self._job
         threading.Thread(target=target, args=(cid, max_n), daemon=True).start()
+        self._log_ui(f"▶ Worker kênh {ch.get('title')} chạy NỀN — đổi combobox không cắt job này.")
 
     def cancel_job(self):
-        if not self._busy:
+        cid = self.current_channel_id()
+        any_busy = any(self._busy_map.values()) or self._busy
+        if not any_busy:
             messagebox.showinfo("Hủy", "Không có job đang chạy.")
             return
-        self._cancel = True
+        if cid and self._channel_busy(cid):
+            self._cancel_map[cid] = True
+            self._log_ui(f"⏹ Hủy worker kênh đang chọn ({cid[-6:]}). Kênh khác vẫn chạy.")
+        else:
+            self._cancel = True
+            for k in list(self._busy_map):
+                if self._busy_map.get(k):
+                    self._cancel_map[k] = True
+            self._log_ui("⏹ Hủy mọi worker đang chạy.")
         self._apply_ui_to_store(silent=True)
-        self._log_ui("⏹ Đã gửi lệnh HỦY — đợi chunk hiện tại xong. Bản cấu hình trên màn hình được giữ cho job sau.")
         self.status_lbl.configure(text="Đang hủy…")
 
     def _pick_n_files(self, cid: str, n: int) -> list[Path]:
@@ -2980,7 +3149,7 @@ class App(ctk.CTk):
                 ))
             threads = []
             for pick, slot in plan:
-                if self._cancel:
+                if self._want_cancel(cid):
                     break
                 t = threading.Thread(
                     target=self._upload_one_file,
@@ -2992,7 +3161,7 @@ class App(ctk.CTk):
             for t in threads:
                 t.join()
             remain = max(0, max_n - done_holder["n"])
-            if remain > 0 and not self._cancel:
+            if remain > 0 and not self._want_cancel(cid):
                 self._persist_pending_job(cid, remain)
             else:
                 self._clear_pending_job()
@@ -3005,25 +3174,31 @@ class App(ctk.CTk):
             tb = traceback.format_exc()
             self.after(0, lambda: self._log_ui(f"Lỗi job song song: {e}\n{tb}"))
         finally:
-            self._busy = False
-            self.after(0, lambda: self.status_lbl.configure(text="Xong / sẵn sàng"))
+            self._busy_map[cid] = False
+            self._busy = any(self._busy_map.values())
+            self._set_worker(cid, status="idle", current_video="", progress=100)
+            self.after(0, lambda: self.status_lbl.configure(text="Xong / sẵn sàng" if not self._busy else "Kênh khác đang chạy…"))
             self.after(0, self._refresh_resume_btn)
+            self.after(0, self._refresh_manager)
             self.after(200, self._start_next_queued)
 
     def _upload_one_file(self, cid: str, pick: Path, slot: str | None, done_holder: dict):
         try:
-            if self._cancel:
+            if self._want_cancel(cid):
                 if slot:
                     locked = self._used_slot_set()
                     locked.discard(slot)
                     self._save_used_slots(locked, cid)
                 return
             ch = self.store.cfg["channels"][cid]
+            self.store.set_channel_status(cid, "yellow")
             youtube = youtube_from_token(ch["token_file"])
             ten = story_name_from_file(pick)
             title = apply_video_name(self.store.cfg["title_tpl"], ten)
             desc = apply_video_name(self.store.cfg["desc_tpl"], ten)
-            tags = [t.strip() for t in self.store.cfg.get("tags", "").split(",") if t.strip()]
+            # v1.0.7: tag riêng cho từng video, tránh cả lô dùng chung một bộ
+            topic = self.store.cfg.get("topic", "Review / khác")
+            tags = [t.strip() for t in random_tags_for_topic(topic, 10).split(",") if t.strip()]
             tags = list(dict.fromkeys(tags + [ten]))
             publish_iso = None
             if slot and not self.store.cfg.get("public_now"):
@@ -3038,7 +3213,7 @@ class App(ctk.CTk):
                 self.store.cfg.get("category_id", "24"),
                 self.store.cfg.get("made_for_kids", False),
                 publish_iso,
-                should_cancel=lambda: self._cancel,
+                should_cancel=lambda: self._want_cancel(cid),
                 notify_subscribers=bool(
                     self.store.cfg.get("premiere_on", True)
                     or self.store.cfg.get("public_now")
@@ -3058,6 +3233,7 @@ class App(ctk.CTk):
                         self.after(0, lambda err=str(te): self._log_ui(f"  ⚠ thumb: {err}"))
             with self._cfg_lock:
                 self.store.mark_used(cid, pick.name)
+                self.store.set_channel_status(cid, "green", len(self.store.used_names(cid)))
             self._maybe_delete_after_up(pick)
             self._commit_upload_checkpoint(cid, pick, slot)
             self.after(0, lambda v=vid, n=pick.name: self._log_ui(
@@ -3131,7 +3307,7 @@ class App(ctk.CTk):
             youtube = youtube_from_token(ch["token_file"])
             done = 0
             while done < max_n:
-                if self._cancel:
+                if self._want_cancel(cid):
                     self.after(0, lambda: self._log_ui("⏹ Đã hủy job. Không đăng video tiếp."))
                     break
                 pending = self.pending_files(cid)
@@ -3146,8 +3322,14 @@ class App(ctk.CTk):
                 ten = story_name_from_file(pick)
                 title = apply_video_name(self.store.cfg["title_tpl"], ten)
                 desc = apply_video_name(self.store.cfg["desc_tpl"], ten)
-                tags = [t.strip() for t in self.store.cfg.get("tags", "").split(",") if t.strip()]
+                topic = (ch.get("topic") or self.store.cfg.get("topic") or "Truyện ma")
+                try:
+                    tag_s = random_tags_for_topic(topic, 10, getattr(self, "_custom_topics", lambda: None)())
+                except Exception:
+                    tag_s = self.store.cfg.get("tags", "")
+                tags = [t.strip() for t in str(tag_s).split(",") if t.strip()]
                 tags = list(dict.fromkeys(tags + [ten]))
+                self._set_worker(cid, status="uploading", current_video=pick.name)
 
                 publish_iso = None
                 if self.store.cfg.get("public_now"):
@@ -3192,7 +3374,7 @@ class App(ctk.CTk):
                         self.store.cfg.get("category_id", "24"),
                         self.store.cfg.get("made_for_kids", False),
                         publish_iso,
-                        should_cancel=lambda: self._cancel,
+                        should_cancel=lambda: self._want_cancel(cid),
                         notify_subscribers=bool(
                             self.store.cfg.get("premiere_on", True)
                             or self.store.cfg.get("public_now")
@@ -3315,8 +3497,10 @@ class App(ctk.CTk):
             tb = traceback.format_exc()
             self.after(0, lambda: self._log_ui(f"Lỗi job: {e}\n{tb}"))
         finally:
-            self._busy = False
-            if self._cancel:
+            self._busy_map[cid] = False
+            self._busy = any(self._busy_map.values())
+            self._set_worker(cid, status="error" if self._want_cancel(cid) else "idle", current_video="")
+            if self._want_cancel(cid):
                 pass
             elif done >= max_n or done > 0:
                 if done >= max_n:
@@ -3325,17 +3509,27 @@ class App(ctk.CTk):
             elif pending := (self.store.cfg.get("pending_job") or {}):
                 if int(pending.get("max_n") or 0) <= 0:
                     self._clear_pending_job()
-            self.after(0, lambda: self.status_lbl.configure(text="Xong / sẵn sàng"))
+            self.after(0, lambda: self.status_lbl.configure(
+                text="Xong / sẵn sàng" if not self._busy else "Kênh khác đang chạy…"
+            ))
             self.after(0, self._refresh_resume_btn)
+            self.after(0, self._refresh_manager)
             self.after(200, self._start_next_queued)
 
     def _start_next_queued(self):
-        if self._busy:
-            return
         q = self.store.cfg.get("job_queue") or []
         if not q:
             return
-        item = q.pop(0)
+        # lấy job kênh KHÔNG đang bận
+        pick_i = None
+        for i, item in enumerate(q):
+            cid = (item or {}).get("cid")
+            if cid and not self._channel_busy(cid):
+                pick_i = i
+                break
+        if pick_i is None:
+            return
+        item = q.pop(pick_i)
         self.store.cfg["job_queue"] = q
         self.store.save()
         cid = item.get("cid")
@@ -3343,15 +3537,8 @@ class App(ctk.CTk):
         if not cid or cid not in self.store.cfg.get("channels", {}):
             self._start_next_queued()
             return
-        # nạp lịch kênh đó rồi chạy
-        labels = self.ch_combo.cget("values")
-        for lb in labels:
-            if cid in str(lb):
-                self.ch_combo.set(lb)
-                break
-        self.on_channel_pick()
-        self._log_ui(f"▶ Lấy job hàng đợi: {self.store.cfg['channels'][cid].get('title')}")
-        self.start_job(max_n, skip_today_warn=True, parallel=max_n > 1)
+        self._log_ui(f"▶ Hàng đợi worker: {self.store.cfg['channels'][cid].get('title')} (không đổi combobox)")
+        self.start_job_for(cid, max_n, parallel=max_n > 1, skip_today_warn=True)
 
 
 if __name__ == "__main__":
