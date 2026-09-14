@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -1488,8 +1488,9 @@ class App(ctk.CTk):
         ).pack(side="left")
         ctk.CTkButton(mhead, text="Làm mới", width=80, height=24,
                       command=self._refresh_manager).pack(side="left", padx=8)
-        self.mgr_box = ctk.CTkTextbox(mgr, height=140, font=ctk.CTkFont(family="Consolas", size=13))
-        self.mgr_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.mgr_scroll = ctk.CTkScrollableFrame(mgr, height=180, fg_color="#121218")
+        self.mgr_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.mgr_box = None  # cũ: textbox — giờ dùng card màu
 
         files_panel = ctk.CTkFrame(right, fg_color="#1c1c24")
         files_panel.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 4))
@@ -1595,57 +1596,53 @@ class App(ctk.CTk):
         return False
 
     def _refresh_manager(self):
-        if not hasattr(self, "mgr_box"):
+        if not hasattr(self, "mgr_scroll"):
             return
-        try:
-            self.mgr_box.delete("1.0", "end")
-        except Exception:
-            return
+        for child in list(self.mgr_scroll.winfo_children()):
+            try:
+                child.destroy()
+            except Exception:
+                pass
         chs = self.store.cfg.get("channels") or {}
         if not chs:
-            self.mgr_box.insert("end", "(chưa có kênh)\n")
+            ctk.CTkLabel(self.mgr_scroll, text="(chưa có kênh)", text_color="#888").pack(anchor="w", padx=6, pady=4)
             return
         today = datetime.now().strftime("%Y-%m-%d")
-        lines = []
         for cid, meta in chs.items():
             w = self._worker(cid)
             w["name"] = meta.get("title") or w.get("name") or cid
-            # uploaded today from history
             n_today = 0
             try:
                 for h in load_json(HISTORY_FILE, []) or []:
-                    if not isinstance(h, dict):
-                        continue
-                    if h.get("cid") == cid and str(h.get("when") or "").startswith(today):
+                    if isinstance(h, dict) and h.get("cid") == cid and str(h.get("when") or "").startswith(today):
                         n_today += 1
             except Exception:
                 n_today = int(w.get("uploaded_today") or 0)
+            n_today = max(n_today, self._today_up_count(cid))
             w["uploaded_today"] = n_today
-            target = len(meta.get("schedule_slots") or []) or 0
+            target = len(self._daily_times_from_lines(meta.get("schedule_slots") or [])) or 0
             st = w.get("status") or "idle"
             err = (w.get("last_error") or "").strip()
             token = meta.get("token_file") or ""
-            if token and not Path(token).exists():
-                st = "error"
-                err = err or "Token lỗi"
+            if token and not Path(str(token)).exists():
+                st, err = "error", (err or "Token lỗi")
+            if self._channel_busy(cid):
+                st = "uploading"
             if st == "uploading":
-                mark = "🟡"
-                extra = f"Đang tải: {w.get('current_video') or '...'}"
-                if w.get("progress"):
-                    extra += f"  {int(w.get('progress') or 0)}%"
+                mark, color, extra = "🟡", "#f0c14b", f"Đang tải: {w.get('current_video') or '...'}"
             elif st == "error" or err:
-                mark = "🔴"
-                extra = err or "Lỗi"
+                mark, color, extra = "🔴", "#ff7b7b", err or "Lỗi"
             elif target and n_today >= target:
-                mark = "🟢"
-                extra = f"Hôm nay: {n_today}/{target} video"
-                st = "done"
+                mark, color, extra = "🟢", "#6ee7a8", f"Hôm nay {n_today}/{target}"
             else:
-                mark = "⚪"
-                extra = f"Chưa chạy hôm nay" if n_today == 0 else f"Hôm nay: {n_today}/{target or '?'}"
+                mark, color = "⚪", "#c8c8d0"
+                extra = "Chưa chạy hôm nay" if n_today == 0 else f"Hôm nay {n_today}/{target or '?'}"
+            card = ctk.CTkFrame(self.mgr_scroll, fg_color="#1a1a22", border_width=1, border_color=color)
+            card.pack(fill="x", padx=4, pady=3)
             title = meta.get("title") or cid[-8:]
-            lines.append(f"{mark} {title}\n   {extra}\n")
-        self.mgr_box.insert("end", "\n".join(lines) if lines else "(trống)\n")
+            ctk.CTkLabel(card, text=f"{mark}  {title}", text_color=color,
+                         font=ctk.CTkFont(size=13, weight="bold"), anchor="w").pack(fill="x", padx=8, pady=(4, 0))
+            ctk.CTkLabel(card, text=extra, text_color="#aaa", anchor="w").pack(fill="x", padx=8, pady=(0, 4))
 
     def _recover_workers(self):
         saved = load_json(CHANNEL_STATUS_FILE, {})
@@ -1703,7 +1700,7 @@ class App(ctk.CTk):
         try:
             daily = self._parse_slot_lines()
             n_day = len(daily) or 0
-            today_n = self._today_up_count() if n_day or True else 0
+            today_n = self._today_up_count(cid) if n_day or True else 0
             remain_slots = []
             if daily:
                 nxt = self._next_repeating_slots(daily, max(1, n_day))
@@ -2421,9 +2418,9 @@ class App(ctk.CTk):
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         return self._daily_times_from_lines(lines)
 
-    def _used_slot_set(self) -> set[str]:
+    def _used_slot_set(self, cid: str | None = None) -> set[str]:
         used = set()
-        cid = self.current_channel_id()
+        cid = cid or self.current_channel_id()
         src = []
         if cid and cid in self.store.cfg.get("channels", {}):
             src = list(self.store.cfg["channels"][cid].get("used_publish_slots") or [])
@@ -2474,12 +2471,16 @@ class App(ctk.CTk):
         self._refresh_slot_preview()
         self._log_ui("Đã xóa mốc khóa. Job sau dùng đúng giờ trong khung.")
 
-    def _slots_today_remaining(self) -> list[str]:
+    def _slots_today_remaining(self, cid: str | None = None) -> list[str]:
         """Chỉ mốc HÔM NAY còn trong tương lai. Giờ đã qua → bỏ, chờ ngày mai."""
-        daily = self._parse_slot_lines()
+        cid = cid or self.current_channel_id()
+        ch = (self.store.cfg.get("channels") or {}).get(cid or "", {}) if cid else {}
+        daily = self._daily_times_from_lines(ch.get("schedule_slots") or [])
+        if not daily and cid == self.current_channel_id():
+            daily = self._parse_slot_lines()
         if not daily:
             return []
-        used = self._used_slot_set() | self._reserved_slot_set()
+        used = self._used_slot_set(cid) | self._reserved_slot_set()
         now = datetime.now() + timedelta(minutes=1)
         day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         out: list[str] = []
@@ -2663,40 +2664,33 @@ class App(ctk.CTk):
         self.store.save()
 
     def _tick_auto_daily(self):
-        # 10s để bắt đúng lúc 0h
+        # 10s — duyệt MỌI kênh, không phụ thuộc combobox đang mở
         self.after(10000, self._tick_auto_daily)
-        if self._busy or not self._licensed:
+        if not self._licensed:
             return
         if hasattr(self, "auto_daily") and not self.auto_daily.get():
             return
         today = datetime.now().strftime("%Y-%m-%d")
         crossed_midnight = self._auto_tick_day and self._auto_tick_day != today
         self._auto_tick_day = today
-        if self._channel_pending() and not crossed_midnight:
-            return
-        cid = self.current_channel_id()
-        if not cid:
-            return
-        ch = self.store.cfg.get("channels", {}).get(cid, {})
-        if (not crossed_midnight) and ch.get("auto_day_done") == today:
-            return
-        if not self.pending_files(cid):
-            return
-        if not (self.store.cfg.get("schedule_enabled", True) or bool(self.sched_on.get())):
-            return
-        left = self._slots_today_remaining()
-        if not left:
-            if crossed_midnight:
-                self._log_ui("☀ 0h rồi nhưng chưa tới mốc đầu — chờ giờ lặp.")
-            else:
-                self._log_ui("☀ Hết mốc hôm nay — dừng. Qua 0h sẽ lặp.")
-            self._mark_auto_day(cid)
-            return
-        if crossed_midnight:
-            self._log_ui(f"☀ 0h — lặp ngày mới, up {len(left)} mốc: {', '.join(left)}")
-        else:
-            self._log_ui(f"☀ Tự up {len(left)} video còn giờ hôm nay: {', '.join(left)}")
-        self.start_job(len(left), skip_today_warn=True, parallel=len(left) > 1)
+        for cid, ch in list((self.store.cfg.get("channels") or {}).items()):
+            if self._channel_busy(cid):
+                continue
+            if (not crossed_midnight) and ch.get("auto_day_done") == today:
+                continue
+            if not self.pending_files(cid):
+                continue
+            left = self._slots_today_remaining(cid)
+            if not left:
+                self._mark_auto_day(cid)
+                continue
+            n = min(len(left), len(self.pending_files(cid)))
+            if n <= 0:
+                continue
+            self._log_ui(
+                f"☀ Auto [{ch.get('title')}]: {n} video — {', '.join(left[:n])}"
+            )
+            self.start_job_for(cid, n, parallel=n > 1, skip_today_warn=True)
 
     def _apply_ui_to_store(self, cid: str | None = None, silent: bool = False):
         """Màn hình hiện tại = nguồn đúng. Ghi đè kênh, không giữ bản lưu cũ."""
@@ -2936,9 +2930,9 @@ class App(ctk.CTk):
         if recovered or released:
             self._log_ui(f"⚡ Recovery v1.0.6: xác minh {recovered} video, trả lại {released} mốc.")
 
-    def _today_up_count(self) -> int:
+    def _today_up_count(self, cid: str | None = None) -> int:
         today = datetime.now().strftime("%Y-%m-%d")
-        return sum(1 for s in self._used_slot_set() if str(s).startswith(today))
+        return sum(1 for s in self._used_slot_set(cid) if str(s).startswith(today))
 
     def start_one_day(self):
         self.start_hang_loat()
@@ -2957,20 +2951,31 @@ class App(ctk.CTk):
             self._log_ui(
                 f"⏸ Qua giờ hôm nay, bỏ: {', '.join(skipped)} — để ngày mai."
             )
+        cid = self.current_channel_id()
         if not left:
             messagebox.showinfo(
                 "Hết giờ hôm nay",
                 "Mọi mốc của kênh này hôm nay đã qua hoặc đã khóa.\n"
                 "Không up bù. Ngày mai tool lặp lại đúng các giờ.",
             )
-            cid = self.current_channel_id()
             if cid:
                 self._mark_auto_day(cid)
             return
+        pending = self.pending_files(cid) if cid else []
+        if not pending:
+            messagebox.showinfo(
+                "Không up lại",
+                "Không còn file CHƯA ĐĂNG trong thư mục kênh này.\n"
+                "File đã up được ghi trong data/uploaded.json — không up trùng.\n"
+                "Ném file mới vào folder rồi Quét file.",
+            )
+            self._log_ui("⏸ Hàng loạt: 0 file pending (đã có trong uploaded.json). Không up lại.")
+            return
+        n = min(len(left), len(pending))
         self._log_ui(
-            f"▶ HÀNG LOẠT kênh hiện tại: {len(left)} mốc còn lại hôm nay → {', '.join(left)}"
+            f"▶ HÀNG LOẠT kênh hiện tại: {n} file × mốc {', '.join(left[:n])}"
         )
-        self.start_job(len(left), parallel=len(left) > 1)
+        self.start_job(n, parallel=n > 1)
 
     def start_job(self, max_n: int, skip_today_warn: bool = False, parallel: bool = False, force_cid: str | None = None):
         if not self._licensed:
@@ -2980,7 +2985,7 @@ class App(ctk.CTk):
             self._apply_ui_to_store(silent=True)
         cid = force_cid or self.current_channel_id()
         daily_n = len(self._parse_slot_lines()) or 1
-        today_n = self._today_up_count()
+        today_n = self._today_up_count(cid)
         if (not skip_today_warn) and daily_n > 0 and today_n >= daily_n:
             ok = messagebox.askyesno(
                 "Hôm nay đã up đủ",
