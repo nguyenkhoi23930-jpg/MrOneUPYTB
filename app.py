@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.13"
+APP_VERSION = "1.0.14"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -1159,6 +1159,8 @@ class App(ctk.CTk):
         self._workers = {}          # cid -> dict status
         self._cancel_map = {}       # cid -> bool
         self._busy_map = {}         # cid -> bool
+        # v1.0.14: chống spam popup token. Kênh lỗi token bị pause riêng cho tới khi OAuth lại.
+        self._token_warned = set()
         self._build()
         self.after(100, self._gate_license)
         self.after(800, self._recover_workers)
@@ -2174,6 +2176,9 @@ class App(ctk.CTk):
                 merged["title"] = info["title"]
                 merged["email"] = info.get("email") or old.get("email") or ""
                 merged["token_file"] = info["token_file"]
+                # OAuth thành công: mở khóa scheduler của kênh và cho phép cảnh báo lại nếu sau này token hỏng.
+                merged["token_needs_reconnect"] = False
+                self._token_warned.discard(info["id"])
                 if old.get("folder"):
                     merged["folder"] = old["folder"]
                 chs[info["id"]] = merged
@@ -2731,6 +2736,9 @@ class App(ctk.CTk):
             # v1.0.10: mỗi kênh có công tắc auto riêng; đổi combobox không tắt worker khác.
             if not ch.get("auto_daily", True):
                 continue
+            # v1.0.14: token hỏng thì pause RIÊNG kênh này, không gọi start_job mỗi 10 giây.
+            if ch.get("token_needs_reconnect", False):
+                continue
             if self._channel_busy(cid):
                 continue
             if (not crossed_midnight) and ch.get("auto_day_done") == today:
@@ -3078,13 +3086,26 @@ class App(ctk.CTk):
             messagebox.showerror("Thiếu thư mục", "Chọn thư mục video khớp kênh này.")
             return
         if not Path(ch.get("token_file", "")).exists():
-            messagebox.showerror("Token", "Kênh chưa OAuth hoặc token mất. Kết nối lại.")
+            msg = "Kênh chưa OAuth hoặc token mất. Kết nối lại."
+            ch["token_needs_reconnect"] = True
+            self.store.save()
+            self._log_ui(f"⏸ [{ch.get('title', cid)}] {msg} Auto Daily đã tạm dừng RIÊNG kênh này.")
+            # Job tự động không bao giờ bật popup. Job bấm tay chỉ báo 1 lần.
+            if not force_cid and cid not in self._token_warned:
+                self._token_warned.add(cid)
+                messagebox.showerror("Token", msg)
             return
         try:
             youtube_from_token(ch["token_file"])
         except Exception as te:
-            messagebox.showerror("Token", classify_yt_error(te))
-            self._log_ui("✗ " + classify_yt_error(te))
+            msg = classify_yt_error(te)
+            ch["token_needs_reconnect"] = True
+            self.store.save()
+            self._log_ui(f"⏸ [{ch.get('title', cid)}] {msg} Auto Daily đã tạm dừng RIÊNG kênh này; bấm Kết nối lại kênh.")
+            # force_cid = scheduler/Auto Daily: chỉ log, TUYỆT ĐỐI không popup lặp.
+            if not force_cid and cid not in self._token_warned:
+                self._token_warned.add(cid)
+                messagebox.showerror("Token", msg)
             return
         picks = self._pick_n_files(cid, max_n)
         bad = [p.name for p in picks if (not p.exists()) or p.stat().st_size < 10_000]
