@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.13"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -1324,7 +1324,7 @@ class App(ctk.CTk):
         self.premiere_on.pack(side="left", padx=(10, 0))
         if self.store.cfg.get("premiere_on", True):
             self.premiere_on.select()
-        self.auto_daily = ctk.CTkCheckBox(srow, text="Tự up mỗi ngày khi tool mở")
+        self.auto_daily = ctk.CTkCheckBox(srow, text="Bật Auto Daily TẤT CẢ KÊNH", command=self._toggle_auto_daily_all)
         self.auto_daily.pack(side="left", padx=(16, 0))
         if self.store.cfg.get("auto_daily", True):
             self.auto_daily.select()
@@ -1698,21 +1698,33 @@ class App(ctk.CTk):
 
     def _refresh_dash(self):
         try:
+            # Dashboard luôn hiển thị theo kênh đang chọn trên UI.
+            # v1.0.11 bị thiếu biến cid ở đây; exception bị nuốt nên toàn bộ nhãn giữ nguyên dấu —.
+            cid = self.current_channel_id()
+            if not cid or cid not in (self.store.cfg.get("channels") or {}):
+                self.dash_today.configure(text="Hôm nay: chưa chọn kênh")
+                self.dash_slots.configure(text="Mốc còn: —")
+                self.dash_thumb.configure(text="Thumb: —")
+                self.dash_queue.configure(text="Hàng đợi kênh: trống")
+                self.dash_last.configure(text="Up gần nhất: —")
+                self.after(4000, self._refresh_dash)
+                return
+
             daily = self._parse_slot_lines()
             n_day = len(daily) or 0
-            today_n = self._today_up_count(cid) if n_day or True else 0
+            today_n = self._today_up_count(cid)
             remain_slots = []
             if daily:
                 nxt = self._next_repeating_slots(daily, max(1, n_day))
                 remain_slots = nxt
             self.dash_today.configure(
-                text=f"Hôm nay đã up {today_n}/{n_day or '?'} video  ·  file chờ: {len(self.pending_files())}"
+                text=f"Hôm nay đã up {today_n}/{n_day or '?'} video  ·  file chờ: {len(self.pending_files(cid))}"
             )
             if remain_slots:
                 self.dash_slots.configure(text="Mốc kế: " + " → ".join(remain_slots[:6]))
             else:
                 self.dash_slots.configure(text="Mốc kế: (chưa có giờ lặp)")
-            files = self.pending_files()
+            files = self.pending_files(cid)
             miss = [p.name for p in files[:80] if not find_thumb_for_video(p)]
             self.dash_thumb.configure(
                 text=f"Thiếu thumb: {len(miss)}/{len(files)}" + (
@@ -2092,6 +2104,19 @@ class App(ctk.CTk):
         self.ch_combo.set(pick or labels[0])
         self.on_channel_pick(self.ch_combo.get())
 
+    def _toggle_auto_daily_all(self):
+        """Bật/tắt Auto Daily đồng loạt cho TẤT CẢ kênh đã lưu."""
+        enabled = bool(self.auto_daily.get()) if hasattr(self, "auto_daily") else True
+        self.store.cfg["auto_daily"] = enabled
+        channels = self.store.cfg.get("channels") or {}
+        for cid, ch in channels.items():
+            if isinstance(ch, dict):
+                ch["auto_daily"] = enabled
+                # Khi bật lại, không xóa lịch sử slot; scheduler tự xét phần còn lại hôm nay.
+        self.store.save()
+        state = "BẬT" if enabled else "TẮT"
+        self._log_ui(f"⚡ Auto Daily hàng loạt: {state} cho {len(channels)} kênh")
+
     def on_channel_pick(self, _=None):
         cid = self.current_channel_id()
         if not cid:
@@ -2108,6 +2133,8 @@ class App(ctk.CTk):
         self.folder_var.set(ch.get("folder", ""))
         # lịch riêng từng kênh
         self._write_slots(ch.get("schedule_slots") or [])
+        # v1.0.11: Auto Daily là công tắc HÀNG LOẠT, không đổi theo kênh đang chọn.
+        # Combobox chỉ để chỉnh cấu hình kênh; không được phép làm thay đổi trạng thái chạy nền.
         if ch.get("used_publish_slots") is not None:
             self.store.cfg["used_publish_slots"] = list(ch.get("used_publish_slots") or [])
         if ch.get("pending_job"):
@@ -2196,7 +2223,9 @@ class App(ctk.CTk):
             raw = self.store.cfg["channels"][cid].get("folder") or ""
             if raw:
                 folder = Path(raw)
-        if folder is None and self.folder_var.get().strip():
+        # v1.0.10: worker của một kênh TUYỆT ĐỐI không được mượn folder đang hiển thị
+        # trên UI. Fallback UI chỉ dành cho thao tác thủ công khi chưa có cid.
+        if folder is None and not cid and self.folder_var.get().strip():
             folder = Path(self.folder_var.get().strip())
         if not folder or not folder.is_dir() or not cid:
             return []
@@ -2480,7 +2509,7 @@ class App(ctk.CTk):
             daily = self._parse_slot_lines()
         if not daily:
             return []
-        used = self._used_slot_set(cid) | self._reserved_slot_set()
+        used = self._used_slot_set(cid) | self._reserved_slot_set(cid)
         now = datetime.now() + timedelta(minutes=1)
         day = now.replace(hour=0, minute=0, second=0, microsecond=0)
         out: list[str] = []
@@ -2570,15 +2599,24 @@ class App(ctk.CTk):
         self._write_slots(self._parse_slot_lines())
         self._log_ui("Đã sắp giờ lặp trong ngày (sớm → muộn), bỏ trùng.")
 
-    def _persist_pending_job(self, cid: str, remaining: int):
+    def _persist_pending_job(self, cid: str, remaining: int, files: list[str] | None = None):
+        """Lưu job dở + CHÍNH XÁC tên file để mất điện không nhảy sang tập kế tiếp."""
         if remaining <= 0:
             self.store.cfg.pop("pending_job", None)
             if cid and cid in self.store.cfg.get("channels", {}):
                 self.store.cfg["channels"][cid].pop("pending_job", None)
         else:
+            old = self._channel_pending(cid) or {}
+            planned = list(files if files is not None else (old.get("files") or []))
+            # Bỏ file đã upload thành công, nhưng giữ nguyên thứ tự các file còn dở.
+            used = self.store.used_names(cid)
+            planned = [str(x) for x in planned if str(x) and str(x) not in used]
+            if planned:
+                planned = planned[:remaining]
             item = {
                 "cid": cid,
                 "max_n": remaining,
+                "files": planned,
                 "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.store.cfg["pending_job"] = item
@@ -2586,6 +2624,22 @@ class App(ctk.CTk):
                 self.store.cfg["channels"][cid]["pending_job"] = dict(item)
         self.store.save()
         self.after(0, self._refresh_resume_btn)
+
+    def _planned_retry_files(self, cid: str) -> list[Path]:
+        """Các file của job dở được ưu tiên tuyệt đối khi bấm Tiếp tục."""
+        p = self._channel_pending(cid)
+        names = list(p.get("files") or [])
+        if not names:
+            return []
+        ch = self.store.cfg.get("channels", {}).get(cid, {})
+        folder = Path(ch.get("folder") or "")
+        used = self.store.used_names(cid)
+        out = []
+        for name in names:
+            fp = folder / str(name)
+            if fp.is_file() and fp.name not in used:
+                out.append(fp)
+        return out
 
     def _clear_pending_job(self):
         item = self.store.cfg.pop("pending_job", None)
@@ -2674,6 +2728,9 @@ class App(ctk.CTk):
         crossed_midnight = self._auto_tick_day and self._auto_tick_day != today
         self._auto_tick_day = today
         for cid, ch in list((self.store.cfg.get("channels") or {}).items()):
+            # v1.0.10: mỗi kênh có công tắc auto riêng; đổi combobox không tắt worker khác.
+            if not ch.get("auto_daily", True):
+                continue
             if self._channel_busy(cid):
                 continue
             if (not crossed_midnight) and ch.get("auto_day_done") == today:
@@ -2710,6 +2767,10 @@ class App(ctk.CTk):
         self.store.cfg["playlist_enabled"] = bool(self.playlist_on.get())
         self.store.cfg["playlist_tpl"] = self.playlist_var.get().strip() or "{TEN_VIDEO} | Full tập"
         self.store.cfg["auto_daily"] = bool(self.auto_daily.get()) if hasattr(self, "auto_daily") else True
+        # v1.0.11: công tắc này là global/batch; giữ mọi channel đồng bộ.
+        for _cid, _ch in (self.store.cfg.get("channels") or {}).items():
+            if isinstance(_ch, dict):
+                _ch["auto_daily"] = self.store.cfg["auto_daily"]
         if hasattr(self, "auto_del_local"):
             self.store.cfg["auto_delete_local"] = bool(self.auto_del_local.get())
         slots = self._parse_slot_lines()
@@ -2737,7 +2798,7 @@ class App(ctk.CTk):
                 "auto_day_done": old.get("auto_day_done"),
                 "schedule_slots": list(slots),
                 "used_publish_slots": used,
-                "auto_daily": self.store.cfg.get("auto_daily", True),
+                "auto_daily": old.get("auto_daily", self.store.cfg.get("auto_daily", True)),
                 "title_tpl": self.store.cfg.get("title_tpl", ""),
                 "desc_tpl": self.store.cfg.get("desc_tpl", ""),
                 "tags": self.store.cfg.get("tags", ""),
@@ -2823,7 +2884,7 @@ class App(ctk.CTk):
         """Chỉ gọi sau khi YouTube đã trả video_id: mốc lúc này mới được tính đã đăng."""
         with self._cfg_lock:
             if slot:
-                used = self._used_slot_set()
+                used = self._used_slot_set(cid)
                 used.add(slot)
                 self._save_used_slots(used, cid)
             rows = self._inflight_entries(cid)
@@ -2984,7 +3045,8 @@ class App(ctk.CTk):
         if not force_cid:
             self._apply_ui_to_store(silent=True)
         cid = force_cid or self.current_channel_id()
-        daily_n = len(self._parse_slot_lines()) or 1
+        target_ch = (self.store.cfg.get("channels") or {}).get(cid or "", {})
+        daily_n = len(self._daily_times_from_lines(target_ch.get("schedule_slots") or [])) or 1
         today_n = self._today_up_count(cid)
         if (not skip_today_warn) and daily_n > 0 and today_n >= daily_n:
             ok = messagebox.askyesno(
@@ -3063,7 +3125,7 @@ class App(ctk.CTk):
         self._busy_map[cid] = True
         self._cancel_map[cid] = False
         self._cancel = False
-        self._persist_pending_job(cid, max_n)
+        self._persist_pending_job(cid, max_n, [p.name for p in picks])
         self._set_worker(cid, status="uploading", current_video="bắt đầu…", last_error="", progress=0)
         self.after(0, lambda: self.status_lbl.configure(text="Đang chạy nền…"))
         target = self._job_parallel if (parallel and max_n > 1) else self._job
@@ -3090,6 +3152,11 @@ class App(ctk.CTk):
 
     def _pick_n_files(self, cid: str, n: int) -> list[Path]:
         pending = list(self.pending_files(cid))
+        planned = self._planned_retry_files(cid)
+        if planned:
+            # Sau crash/mất điện: 10-11 vẫn là 10-11, không được chọn 12-13.
+            rest = [p for p in pending if p.name not in {x.name for x in planned}]
+            pending = planned + rest
         out: list[Path] = []
         taken: set[str] = set()
         for _ in range(n):
@@ -3103,9 +3170,8 @@ class App(ctk.CTk):
 
     def _lock_n_slots(self, cid: str, n: int) -> list[str]:
         with self._slot_lock:
-            daily = self._parse_slot_lines() or self._daily_times_from_lines(
-                self.store.cfg.get("schedule_slots") or []
-            )
+            ch = (self.store.cfg.get("channels") or {}).get(cid, {})
+            daily = self._daily_times_from_lines(ch.get("schedule_slots") or [])
             if not daily:
                 return []
             self.store.cfg["schedule_slots"] = daily
@@ -3191,7 +3257,7 @@ class App(ctk.CTk):
         try:
             if self._want_cancel(cid):
                 if slot:
-                    locked = self._used_slot_set()
+                    locked = self._used_slot_set(cid)
                     locked.discard(slot)
                     self._save_used_slots(locked, cid)
                 return
@@ -3199,10 +3265,10 @@ class App(ctk.CTk):
             self.store.set_channel_status(cid, "yellow")
             youtube = youtube_from_token(ch["token_file"])
             ten = story_name_from_file(pick)
-            title = apply_video_name(self.store.cfg["title_tpl"], ten)
-            desc = apply_video_name(self.store.cfg["desc_tpl"], ten)
-            # v1.0.7: tag riêng cho từng video, tránh cả lô dùng chung một bộ
-            topic = self.store.cfg.get("topic", "Review / khác")
+            title = apply_video_name(ch.get("title_tpl") or self.store.cfg.get("title_tpl", ""), ten)
+            desc = apply_video_name(ch.get("desc_tpl") or self.store.cfg.get("desc_tpl", ""), ten)
+            # v1.0.10: worker lấy cấu hình đúng channel_id, không lấy kênh đang chọn.
+            topic = ch.get("topic") or self.store.cfg.get("topic", "Review / khác")
             tags = [t.strip() for t in random_tags_for_topic(topic, 10).split(",") if t.strip()]
             tags = list(dict.fromkeys(tags + [ten]))
             publish_iso = None
