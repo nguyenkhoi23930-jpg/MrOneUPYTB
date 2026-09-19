@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.16"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -2139,9 +2139,6 @@ class App(ctk.CTk):
         # Combobox chỉ để chỉnh cấu hình kênh; không được phép làm thay đổi trạng thái chạy nền.
         if ch.get("used_publish_slots") is not None:
             self.store.cfg["used_publish_slots"] = list(ch.get("used_publish_slots") or [])
-        if ch.get("pending_job"):
-            self.store.cfg["pending_job"] = dict(ch["pending_job"])
-            self.store.cfg["pending_job"]["cid"] = cid
         self._refresh_slot_preview()
         self._refresh_resume_btn()
         if ch.get("title_tpl"):
@@ -2605,33 +2602,30 @@ class App(ctk.CTk):
         self._log_ui("Đã sắp giờ lặp trong ngày (sớm → muộn), bỏ trùng.")
 
     def _persist_pending_job(self, cid: str, remaining: int, files: list[str] | None = None):
-        """Lưu job dở + CHÍNH XÁC tên file để mất điện không nhảy sang tập kế tiếp."""
+        """v1.0.16: pending/recovery is 100% per-channel; never global."""
+        if not cid or cid not in self.store.cfg.get("channels", {}):
+            return
+        ch = self.store.cfg["channels"][cid]
         if remaining <= 0:
-            self.store.cfg.pop("pending_job", None)
-            if cid and cid in self.store.cfg.get("channels", {}):
-                self.store.cfg["channels"][cid].pop("pending_job", None)
+            ch.pop("pending_job", None)
         else:
-            old = self._channel_pending(cid) or {}
+            old = ch.get("pending_job") or {}
             planned = list(files if files is not None else (old.get("files") or []))
-            # Bỏ file đã upload thành công, nhưng giữ nguyên thứ tự các file còn dở.
             used = self.store.used_names(cid)
             planned = [str(x) for x in planned if str(x) and str(x) not in used]
+            # remaining is descriptive only; exact file names are the source of truth.
             if planned:
-                planned = planned[:remaining]
-            item = {
-                "cid": cid,
-                "max_n": remaining,
-                "files": planned,
+                remaining = len(planned)
+            ch["pending_job"] = {
+                "cid": cid, "max_n": int(remaining), "files": planned,
                 "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
-            self.store.cfg["pending_job"] = item
-            if cid and cid in self.store.cfg.get("channels", {}):
-                self.store.cfg["channels"][cid]["pending_job"] = dict(item)
+        # Remove legacy global checkpoint so another channel can never overwrite it.
+        self.store.cfg.pop("pending_job", None)
         self.store.save()
         self.after(0, self._refresh_resume_btn)
 
     def _planned_retry_files(self, cid: str) -> list[Path]:
-        """Các file của job dở được ưu tiên tuyệt đối khi bấm Tiếp tục."""
         p = self._channel_pending(cid)
         names = list(p.get("files") or [])
         if not names:
@@ -2639,19 +2633,21 @@ class App(ctk.CTk):
         ch = self.store.cfg.get("channels", {}).get(cid, {})
         folder = Path(ch.get("folder") or "")
         used = self.store.used_names(cid)
-        out = []
-        for name in names:
-            fp = folder / str(name)
-            if fp.is_file() and fp.name not in used:
-                out.append(fp)
-        return out
+        return [folder / str(name) for name in names
+                if str(name) and str(name) not in used and (folder / str(name)).is_file()]
 
-    def _clear_pending_job(self):
-        item = self.store.cfg.pop("pending_job", None)
-        cid = (item or {}).get("cid") or self.current_channel_id()
+    def _remaining_job_files(self, cid: str, original: list[str]) -> list[str]:
+        used = self.store.used_names(cid)
+        return [str(name) for name in original if str(name) and str(name) not in used]
+
+    def _clear_pending_job(self, cid: str | None = None):
+        cid = cid or self.current_channel_id()
+        changed = False
         if cid and cid in self.store.cfg.get("channels", {}):
-            self.store.cfg["channels"][cid].pop("pending_job", None)
-        if item is not None:
+            changed = self.store.cfg["channels"][cid].pop("pending_job", None) is not None
+        # migration cleanup only; never use this value for recovery.
+        self.store.cfg.pop("pending_job", None)
+        if changed:
             self.store.save()
         self.after(0, self._refresh_resume_btn)
 
@@ -2659,14 +2655,7 @@ class App(ctk.CTk):
         cid = cid or self.current_channel_id()
         if not cid:
             return {}
-        ch = self.store.cfg.get("channels", {}).get(cid, {})
-        p = ch.get("pending_job") or {}
-        g = self.store.cfg.get("pending_job") or {}
-        if p.get("max_n"):
-            return p
-        if g.get("cid") == cid and g.get("max_n"):
-            return g
-        return {}
+        return (self.store.cfg.get("channels", {}).get(cid, {}).get("pending_job") or {})
 
     def _refresh_resume_btn(self):
         if not hasattr(self, "btn_resume"):
@@ -2698,15 +2687,15 @@ class App(ctk.CTk):
             return
         self._recover_inflight_uploads()
         self._refresh_resume_btn()
-        pending = self.store.cfg.get("pending_job") or {}
-        n = int(pending.get("max_n") or 0)
-        cid = pending.get("cid")
-        if n > 0 and cid in self.store.cfg.get("channels", {}):
-            title = self.store.cfg["channels"][cid].get("title", cid)
-            self._log_ui(
-                f"⚠ Máy vừa mở lại — kênh [{title}] còn job dở ({n} video). "
-                "Chọn đúng kênh rồi bấm TIẾP TỤC."
-            )
+        for cid, ch in (self.store.cfg.get("channels") or {}).items():
+            pending = ch.get("pending_job") or {}
+            n = int(pending.get("max_n") or 0)
+            if n > 0:
+                title = ch.get("title", cid)
+                self._log_ui(
+                    f"⚠ Máy vừa mở lại — kênh [{title}] còn job dở ({n} video). "
+                    "Chọn kênh rồi bấm TIẾP TỤC."
+                )
             labels = self.ch_combo.cget("values")
             for lb in labels:
                 if cid in str(lb):
@@ -2740,6 +2729,18 @@ class App(ctk.CTk):
             if ch.get("token_needs_reconnect", False):
                 continue
             if self._channel_busy(cid):
+                continue
+            # v1.0.16: unfinished batch has absolute priority over new episodes.
+            # Auto Daily must resume 12/13 before it is allowed to queue 14/15/16.
+            pj = self._channel_pending(cid)
+            pj_names = list(pj.get("files") or [])
+            if int(pj.get("max_n") or 0) > 0 and pj_names:
+                retry = self._planned_retry_files(cid)
+                if retry:
+                    n_retry = min(len(retry), int(pj.get("max_n") or len(retry)))
+                    self._log_ui(f"↩ Auto resume [{ch.get('title')}]: " + ", ".join(p.name for p in retry[:n_retry]))
+                    self.start_job_for(cid, n_retry, parallel=n_retry > 1, skip_today_warn=True)
+                # Whether files are present or temporarily missing, never skip ahead.
                 continue
             if (not crossed_midnight) and ch.get("auto_day_done") == today:
                 continue
@@ -2965,10 +2966,10 @@ class App(ctk.CTk):
                 slot = str(row.get("slot") or "")
                 title = str(row.get("title") or "")
                 vid = str(row.get("video_id") or "")
-                exists = self._yt_video_exists(youtube, vid)
-                if not exists:
-                    vid = self._yt_find_recent_title(youtube, title)
-                    exists = bool(vid)
+                # v1.0.16: NEVER infer DONE from a title search. A same/similar old title
+                # can falsely mark an unfinished episode as uploaded and make Auto Daily skip it.
+                # Only a video_id captured from YouTube's successful upload response is trusted.
+                exists = self._yt_video_exists(youtube, vid) if vid else False
                 if exists:
                     folder = ch.get("folder") or ""
                     pick = Path(folder) / fname if folder else Path(fname)
@@ -2992,10 +2993,9 @@ class App(ctk.CTk):
         # nếu không nút Tiếp tục sẽ up dư thêm video mới.
         for rcid, n_ok in recovered_by_cid.items():
             chp = self.store.cfg.get("channels", {}).get(rcid, {}).get("pending_job") or {}
-            gp = self.store.cfg.get("pending_job") or {}
-            cur = int(chp.get("max_n") or (gp.get("max_n") if gp.get("cid") == rcid else 0) or 0)
-            if cur > 0:
-                self._persist_pending_job(rcid, max(0, cur - n_ok))
+            original = list(chp.get("files") or [])
+            remaining_files = self._remaining_job_files(rcid, original)
+            self._persist_pending_job(rcid, len(remaining_files), remaining_files)
         if recovered or released:
             self._log_ui(f"⚡ Recovery v1.0.6: xác minh {recovered} video, trả lại {released} mốc.")
 
@@ -3132,7 +3132,7 @@ class App(ctk.CTk):
         dup = []
         for p in picks:
             ten = story_name_from_file(p)
-            title = apply_video_name(self.store.cfg.get("title_tpl", ""), ten)
+            title = apply_video_name(ch.get("title_tpl") or self.store.cfg.get("title_tpl", ""), ten)
             if p.name in used_names or title in titles_hist:
                 dup.append(p.name)
         if dup:
@@ -3198,7 +3198,7 @@ class App(ctk.CTk):
             self.store.cfg["schedule_slots"] = daily
             self._prune_used_to_clocks(daily)
             # chỉ khóa giờ còn lại HÔM NAY của kênh này
-            slots = self._slots_today_remaining()[:n]
+            slots = self._slots_today_remaining(cid)[:n]
             # không trùng trong lô
             uniq: list[str] = []
             seen: set[str] = set()
@@ -3222,12 +3222,17 @@ class App(ctk.CTk):
                 f"=== {APP_NAME} · SONG SONG {max_n} video · {ch.get('title')} ==="
             ))
             files = self._pick_n_files(cid, max_n)
+            original_batch = [p.name for p in files]
+            # Persist the exact batch again at worker entry. Never reconstruct a
+            # failed batch from "next pending" episodes.
+            if original_batch:
+                self._persist_pending_job(cid, len(original_batch), original_batch)
             if not files:
                 self.after(0, lambda: self._log_ui("⛔ HẾT video chưa đăng."))
-                self._clear_pending_job()
+                self._clear_pending_job(cid)
                 return
             slots = []
-            if self.store.cfg.get("schedule_enabled") and not self.store.cfg.get("public_now"):
+            if ch.get("schedule_enabled", self.store.cfg.get("schedule_enabled", True)) and not ch.get("public_now", self.store.cfg.get("public_now", False)):
                 slots = self._lock_n_slots(cid, len(files))
                 if len(slots) < len(files):
                     self.after(0, lambda: self._log_ui("⚠ Không đủ mốc giờ trống."))
@@ -3252,11 +3257,14 @@ class App(ctk.CTk):
                 t.start()
             for t in threads:
                 t.join()
-            remain = max(0, max_n - done_holder["n"])
-            if remain > 0 and not self._want_cancel(cid):
-                self._persist_pending_job(cid, remain)
+            remaining_files = self._remaining_job_files(cid, original_batch)
+            remain = len(remaining_files)
+            if remain > 0:
+                # IMPORTANT: keep exact failed/unfinished names (e.g. 12,13).
+                # Do not replace them with 14,15,16 on the next scheduler tick.
+                self._persist_pending_job(cid, remain, remaining_files)
             else:
-                self._clear_pending_job()
+                self._clear_pending_job(cid)
                 self._mark_auto_day(cid)
             self.after(0, lambda n=done_holder["n"]: self._log_ui(
                 f"✓ Xong lô song song: {n} video."
@@ -3293,7 +3301,7 @@ class App(ctk.CTk):
             tags = [t.strip() for t in random_tags_for_topic(topic, 10).split(",") if t.strip()]
             tags = list(dict.fromkeys(tags + [ten]))
             publish_iso = None
-            if slot and not self.store.cfg.get("public_now"):
+            if slot and not ch.get("public_now", self.store.cfg.get("public_now", False)):
                 local = datetime.strptime(slot, "%Y-%m-%d %H:%M")
                 publish_iso = to_rfc3339_utc(local, self.store.cfg.get("timezone", "Asia/Ho_Chi_Minh"))
                 self.after(0, lambda t=title, s=slot: self._log_ui(
@@ -3307,18 +3315,18 @@ class App(ctk.CTk):
                 publish_iso,
                 should_cancel=lambda: self._want_cancel(cid),
                 notify_subscribers=bool(
-                    self.store.cfg.get("premiere_on", True)
-                    or self.store.cfg.get("public_now")
+                    ch.get("premiere_on", self.store.cfg.get("premiere_on", True))
+                    or ch.get("public_now", self.store.cfg.get("public_now", False))
                 ),
             )
             vid = resp.get("id", "?")
             self._checkpoint_set_video_id(cid, pick, vid)
-            if self.store.cfg.get("auto_thumb", True):
+            if ch.get("auto_thumb", self.store.cfg.get("auto_thumb", True)):
                 th = find_thumb_for_video(pick)
                 if th:
                     try:
                         upload_img = th
-                        if self.store.cfg.get("overlay_thumb_text", True):
+                        if ch.get("overlay_thumb_text", self.store.cfg.get("overlay_thumb_text", True)):
                             upload_img = overlay_story_on_thumb(th, ten, THUMB_TMP)
                         set_thumbnail(youtube, vid, upload_img)
                     except Exception as te:
@@ -3349,7 +3357,7 @@ class App(ctk.CTk):
                     self.after(0, lambda s=slot: self._log_ui(f"  ✓ Lên lịch: {s}"))
                 except Exception as se:
                     self.after(0, lambda err=str(se): self._log_ui(f"  ⚠ lịch: {err}"))
-                if self.store.cfg.get("premiere_on", True):
+                if ch.get("premiere_on", self.store.cfg.get("premiere_on", True)):
                     try:
                         local_dt = datetime.strptime(slot, "%Y-%m-%d %H:%M")
                         studio_set_schedule_premiere(youtube, vid, local_dt, True)
@@ -3362,11 +3370,11 @@ class App(ctk.CTk):
                         )
                     except Exception:
                         pass
-            if self.store.cfg.get("playlist_enabled", True) and extract_episode(pick) is not None:
+            if ch.get("playlist_enabled", self.store.cfg.get("playlist_enabled", True)) and extract_episode(pick) is not None:
                 try:
                     series = series_name_from_file(pick)
                     pl_title = apply_video_name(
-                        self.store.cfg.get("playlist_tpl", "{TEN_VIDEO} | Full tập"), series
+                        ch.get("playlist_tpl") or self.store.cfg.get("playlist_tpl", "{TEN_VIDEO} | Full tập"), series
                     )
                     with self._cfg_lock:
                         chs = self.store.cfg.setdefault("channels", {})
@@ -3403,17 +3411,21 @@ class App(ctk.CTk):
                     self.after(0, lambda: self._log_ui("⏹ Đã hủy job. Không đăng video tiếp."))
                     break
                 pending = self.pending_files(cid)
+                planned_retry = self._planned_retry_files(cid)
+                if planned_retry:
+                    names = {p.name for p in planned_retry}
+                    pending = planned_retry + [p for p in pending if p.name not in names]
                 if not pending:
                     self.after(0, lambda: self._log_ui("⛔ HẾT video chưa đăng. Tạm dừng."))
                     self.after(0, lambda: messagebox.showwarning("HẾT", "Hết truyện trong thư mục kênh này."))
-                    self._clear_pending_job()
+                    self._clear_pending_job(cid)
                     break
                 pick = self.pick_next_file(pending)
                 if pick is None:
                     break
                 ten = story_name_from_file(pick)
-                title = apply_video_name(self.store.cfg["title_tpl"], ten)
-                desc = apply_video_name(self.store.cfg["desc_tpl"], ten)
+                title = apply_video_name(ch.get("title_tpl") or self.store.cfg.get("title_tpl", ""), ten)
+                desc = apply_video_name(ch.get("desc_tpl") or self.store.cfg.get("desc_tpl", ""), ten)
                 topic = (ch.get("topic") or self.store.cfg.get("topic") or "Truyện ma")
                 try:
                     tag_s = random_tags_for_topic(topic, 10, getattr(self, "_custom_topics", lambda: None)())
@@ -3424,9 +3436,9 @@ class App(ctk.CTk):
                 self._set_worker(cid, status="uploading", current_video=pick.name)
 
                 publish_iso = None
-                if self.store.cfg.get("public_now"):
+                if ch.get("public_now", self.store.cfg.get("public_now", False)):
                     self.after(0, lambda t=title: self._log_ui(f"→ Upload CÔNG CHIẾU NGAY: {t}"))
-                elif self.store.cfg.get("schedule_enabled"):
+                elif ch.get("schedule_enabled", self.store.cfg.get("schedule_enabled", True)):
                     daily = self._daily_times_from_lines(
                         self.store.cfg.get("schedule_slots") or self._parse_slot_lines()
                     )
@@ -3458,7 +3470,7 @@ class App(ctk.CTk):
                 else:
                     self.after(0, lambda t=title: self._log_ui(f"→ Upload public ngay: {t}"))
 
-                if not self.store.cfg.get("schedule_enabled") or self.store.cfg.get("public_now"):
+                if not ch.get("schedule_enabled", self.store.cfg.get("schedule_enabled", True)) or ch.get("public_now", self.store.cfg.get("public_now", False)):
                     self._checkpoint_upload(cid, pick, None, title, state="uploading")
                 try:
                     resp = upload_video(
@@ -3468,18 +3480,18 @@ class App(ctk.CTk):
                         publish_iso,
                         should_cancel=lambda: self._want_cancel(cid),
                         notify_subscribers=bool(
-                            self.store.cfg.get("premiere_on", True)
-                            or self.store.cfg.get("public_now")
+                            ch.get("premiere_on", self.store.cfg.get("premiere_on", True))
+                            or ch.get("public_now", self.store.cfg.get("public_now", False))
                         ),
                     )
                     vid = resp.get("id", "?")
                     self._checkpoint_set_video_id(cid, pick, vid)
-                    if self.store.cfg.get("auto_thumb", True):
+                    if ch.get("auto_thumb", self.store.cfg.get("auto_thumb", True)):
                         th = find_thumb_for_video(pick)
                         if th:
                             try:
                                 upload_img = th
-                                if self.store.cfg.get("overlay_thumb_text", True):
+                                if ch.get("overlay_thumb_text", self.store.cfg.get("overlay_thumb_text", True)):
                                     upload_img = overlay_story_on_thumb(th, ten, THUMB_TMP)
                                     self.after(0, lambda: self._log_ui("  đã đè chữ tên video lên thumb"))
                                 set_thumbnail(youtube, vid, upload_img)
@@ -3501,7 +3513,7 @@ class App(ctk.CTk):
                         "video_id": vid,
                         "slot": self.store.cfg.get("_slot_in_use") or "",
                     })
-                    if publish_iso and not self.store.cfg.get("public_now"):
+                    if publish_iso and not ch.get("public_now", self.store.cfg.get("public_now", False)):
                         used_slot = self.store.cfg.get("_slot_in_use") or ""
                         local_dt = datetime.strptime(used_slot, "%Y-%m-%d %H:%M") if used_slot else None
                         time.sleep(2)
@@ -3517,7 +3529,7 @@ class App(ctk.CTk):
                             self.after(0, lambda err=str(se): self._log_ui(
                                 f"  ⚠ Gắn lịch Data API: {err}"
                             ))
-                        if local_dt is not None and self.store.cfg.get("premiere_on", True):
+                        if local_dt is not None and ch.get("premiere_on", self.store.cfg.get("premiere_on", True)):
                             try:
                                 studio_set_schedule_premiere(youtube, vid, local_dt, True)
                                 self.after(0, lambda: self._log_ui(
@@ -3541,11 +3553,11 @@ class App(ctk.CTk):
                             except Exception:
                                 pass
                     # playlist cho video có số tập
-                    if self.store.cfg.get("playlist_enabled", True) and extract_episode(pick) is not None:
+                    if ch.get("playlist_enabled", self.store.cfg.get("playlist_enabled", True)) and extract_episode(pick) is not None:
                         try:
                             series = series_name_from_file(pick)
                             pl_title = apply_video_name(
-                                self.store.cfg.get("playlist_tpl", "{TEN_VIDEO} | Full tập"), series
+                                ch.get("playlist_tpl") or self.store.cfg.get("playlist_tpl", "{TEN_VIDEO} | Full tập"), series
                             )
                             chs = self.store.cfg.setdefault("channels", {})
                             chm = chs.setdefault(cid, {})
@@ -3561,7 +3573,7 @@ class App(ctk.CTk):
                             self.after(0, lambda t=pl_title: self._log_ui(f"  ✓ vào playlist: {t}"))
                         except Exception as pe:
                             self.after(0, lambda err=str(pe): self._log_ui(f"  ⚠ playlist: {err}"))
-                    if self.store.cfg.get("schedule_enabled"):
+                    if ch.get("schedule_enabled", self.store.cfg.get("schedule_enabled", True)):
                         self.store.cfg.pop("_slot_in_use", None)
                         self.store.save()
                         self.after(0, self._refresh_slot_preview)
@@ -3570,7 +3582,7 @@ class App(ctk.CTk):
                     if remain > 0:
                         self._persist_pending_job(cid, remain)
                     else:
-                        self._clear_pending_job()
+                        self._clear_pending_job(cid)
                     self.after(0, self.on_scan)
                 except JobCancelled:
                     self.store.cfg.pop("_slot_in_use", None)
@@ -3596,11 +3608,11 @@ class App(ctk.CTk):
                 pass
             elif done >= max_n or done > 0:
                 if done >= max_n:
-                    self._clear_pending_job()
+                    self._clear_pending_job(cid)
                     self._mark_auto_day(cid)
-            elif pending := (self.store.cfg.get("pending_job") or {}):
+            elif pending := self._channel_pending(cid):
                 if int(pending.get("max_n") or 0) <= 0:
-                    self._clear_pending_job()
+                    self._clear_pending_job(cid)
             self.after(0, lambda: self.status_lbl.configure(
                 text="Xong / sẵn sàng" if not self._busy else "Kênh khác đang chạy…"
             ))
