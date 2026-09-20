@@ -32,7 +32,7 @@ from tkinter import filedialog, messagebox
 
 # ---------- version / branding ----------
 APP_NAME = "MrOneUPYTB"
-APP_VERSION = "1.0.26"
+APP_VERSION = "1.0.35"
 MASTER_KEY = "MrOne781933"
 # GitHub Releases — chỉ up file .exe, tag = version (vd v1.0.1)
 GITHUB_OWNER = "nguyenkhoi23930-jpg"
@@ -609,7 +609,7 @@ def yt_available():
 
 
 def connect_channel() -> dict | None:
-    # v1.0.26: ưu tiên secret cạnh EXE để có thể thay OAuth client mà không rebuild.
+    # v1.0.27: ưu tiên secret cạnh EXE để có thể thay OAuth client mà không rebuild.
     # Nếu không có, dùng bản client_secret.json đã được PyInstaller nhúng vào EXE.
     external_cs = app_dir() / "client_secret.json"
     embedded_cs = resolve_resource("client_secret.json")
@@ -680,8 +680,159 @@ def youtube_from_token(token_file: str):
     return build("youtube", "v3", credentials=creds)
 
 
+def youtube_channel_inventory(youtube, max_items: int | None = None) -> list[dict]:
+    """Read the authenticated channel's Uploads playlist with full pagination.
+
+    By default there is NO item cap: episode-gap and future-schedule checks must
+    see the whole owner-visible inventory. ``max_items`` remains available only
+    for explicitly bounded callers/tests. Returns public/private/scheduled rows.
+    """
+    ch = youtube.channels().list(part="contentDetails", mine=True).execute()
+    items = ch.get("items") or []
+    if not items:
+        return []
+    uploads = (((items[0].get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads"))
+    if not uploads:
+        return []
+    ids: list[str] = []
+    titles: dict[str, str] = {}
+    token = None
+    while max_items is None or len(ids) < max_items:
+        r = youtube.playlistItems().list(
+            part="snippet,contentDetails", playlistId=uploads, maxResults=50,
+            pageToken=token,
+        ).execute()
+        for row in r.get("items") or []:
+            vid = str((row.get("contentDetails") or {}).get("videoId") or "").strip()
+            if not vid:
+                continue
+            ids.append(vid)
+            titles[vid] = str((row.get("snippet") or {}).get("title") or "")
+            if max_items is not None and len(ids) >= max_items:
+                break
+        token = r.get("nextPageToken")
+        if not token or (max_items is not None and len(ids) >= max_items):
+            break
+    out: list[dict] = []
+    for i in range(0, len(ids), 50):
+        batch = ids[i:i+50]
+        vr = youtube.videos().list(part="snippet,status,processingDetails", id=",".join(batch)).execute()
+        for row in vr.get("items") or []:
+            vid = str(row.get("id") or "")
+            sn = row.get("snippet") or {}
+            st = row.get("status") or {}
+            pd = row.get("processingDetails") or {}
+            out.append({
+                "video_id": vid,
+                "title": str(sn.get("title") or titles.get(vid) or ""),
+                "published_at": str(sn.get("publishedAt") or ""),
+                "publish_at": str(st.get("publishAt") or ""),
+                "privacy": str(st.get("privacyStatus") or ""),
+                "processing": str(pd.get("processingStatus") or ""),
+            })
+    return out
+
+
+def extract_episode_text(text: str) -> int | None:
+    """Extract an episode number from a YouTube title conservatively.
+
+    Prefer explicit Tập/Tap/EP/Episode markers. A leading number is accepted
+    only when separated like ``12 - title`` or ``[12] title``. This deliberately
+    avoids treating years, dates, view counts or arbitrary trailing numbers as
+    episode numbers.
+    """
+    s = str(text or "").strip()
+    patterns = [
+        r"(?:tập|tap|ep|episode)\s*[-._:#]?\s*(\d{1,4})(?!\d)",
+        r"^\s*(\d{1,4})\s*[-._:|)]\s*\S",
+        r"^\s*[\[(]\s*(\d{1,4})\s*[\])]\s*\S",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m:
+            n = int(m.group(1))
+            if 1 <= n <= 9999:
+                return n
+    return None
+
+
+def youtube_inventory_dates(rows: list[dict], tz_name: str = "Asia/Ho_Chi_Minh") -> set[str]:
+    """Future scheduled calendar dates in the configured local timezone."""
+    import pytz
+    tz = pytz.timezone(tz_name)
+    out: set[str] = set()
+    now = datetime.now(tz)
+    for row in rows:
+        raw = str(row.get("publish_at") or "").strip()
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(tz)
+            if dt > now:
+                out.add(dt.strftime("%Y-%m-%d"))
+        except Exception:
+            pass
+    return out
+
+
 class JobCancelled(Exception):
     pass
+
+
+class VideoProcessingPending(Exception):
+    """Upload bytes finished, but YouTube has not finished processing yet."""
+    pass
+
+
+class ThumbnailRequiredError(Exception):
+    """Video is ready but required custom thumbnail is not confirmed yet."""
+    pass
+
+
+def get_video_processing(youtube, video_id: str) -> dict:
+    """Return YouTube processing state for an uploaded video owned by this channel."""
+    try:
+        r = youtube.videos().list(
+            part="processingDetails,status", id=video_id
+        ).execute()
+        items = r.get("items") or []
+        if not items:
+            return {"status": "missing", "reason": "video_not_found"}
+        pd = items[0].get("processingDetails") or {}
+        return {
+            "status": str(pd.get("processingStatus") or "unknown").lower(),
+            "reason": str(pd.get("processingFailureReason") or pd.get("processingIssuesAvailability") or ""),
+        }
+    except Exception as e:
+        return {"status": "unknown", "reason": str(e)}
+
+
+def wait_video_processing(youtube, video_id: str, should_cancel=None, on_state=None, timeout_seconds: int = 1800):
+    """Do not let a batch advance until YouTube confirms processing succeeded.
+
+    A timeout is intentionally NOT treated as upload failure: the video_id is kept in
+    the inflight checkpoint so restart/resume cannot upload the same episode again.
+    """
+    started = time.time()
+    last = None
+    while True:
+        if should_cancel and should_cancel():
+            raise JobCancelled("Người dùng hủy job")
+        info = get_video_processing(youtube, video_id)
+        st = info.get("status", "unknown")
+        if st != last and on_state:
+            on_state(st, info.get("reason", ""))
+            last = st
+        if st == "succeeded":
+            return info
+        if st in {"failed", "terminated"}:
+            raise RuntimeError(f"YouTube xử lý video thất bại: {info.get('reason') or st}")
+        if time.time() - started >= timeout_seconds:
+            raise VideoProcessingPending(
+                f"YouTube vẫn đang xử lý video {video_id} sau {timeout_seconds//60} phút; "
+                "đã giữ checkpoint, KHÔNG upload tập kế tiếp."
+            )
+        time.sleep(15)
 
 
 def upload_video(youtube, file_path: Path, title: str, description: str, tags: list[str],
@@ -971,9 +1122,39 @@ def overlay_story_on_thumb(src: Path, ten_truyen: str, out_dir: Path) -> Path:
 
 
 def set_thumbnail(youtube, video_id: str, image_path: Path):
+    """Upload a custom thumbnail and return only after YouTube accepts it."""
     from googleapiclient.http import MediaFileUpload
-    media = MediaFileUpload(str(image_path), mimetype="image/jpeg", resumable=True)
-    youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
+    media = MediaFileUpload(str(image_path), mimetype="image/jpeg", resumable=False)
+    return youtube.thumbnails().set(videoId=video_id, media_body=media).execute()
+
+
+def ensure_required_thumbnail(youtube, video_id: str, pick: Path, ch: dict, cfg: dict, ten: str):
+    """When Auto Thumb is enabled, custom thumbnail acceptance is mandatory before DONE."""
+    if not ch.get("auto_thumb", cfg.get("auto_thumb", True)):
+        return None
+    th = find_thumb_for_video(pick)
+    if not th or not th.is_file():
+        raise ThumbnailRequiredError(
+            f"Auto Thumb đang bật nhưng không thấy thumbnail cho {pick.name}. "
+            "Giữ checkpoint/file local và không chuyển tập tiếp."
+        )
+    upload_img = th
+    if ch.get("overlay_thumb_text", cfg.get("overlay_thumb_text", True)):
+        upload_img = overlay_story_on_thumb(th, ten, THUMB_TMP)
+    last = None
+    for attempt in range(1, 4):
+        try:
+            resp = set_thumbnail(youtube, video_id, upload_img)
+            if isinstance(resp, dict) and resp.get("id") and str(resp.get("id")) != str(video_id):
+                raise RuntimeError("YouTube trả thumbnail cho video_id không khớp")
+            return th
+        except Exception as e:
+            last = e
+            if attempt < 3:
+                time.sleep(3 * attempt)
+    raise ThumbnailRequiredError(
+        f"YouTube chưa xác nhận thumbnail sau 3 lần thử: {last}"
+    )
 
 
 def find_playlist_id(youtube, title: str) -> str | None:
@@ -1064,6 +1245,7 @@ class Store:
                 "playlist_enabled": True,
                 "playlist_tpl": "{TEN_VIDEO} | Full tập",
                 "batch_n": 3,
+                "auto_delete_local": True,
                 "channel_status": {},
             },
         )
@@ -1097,6 +1279,23 @@ class Store:
             lst = list(self.uploaded.get(ch_id, []))
             self.uploaded[ch_id] = [x for x in lst if x != filename]
             self.save()
+
+    def forget_used_many(self, ch_id: str, filenames) -> list[str]:
+        """Requeue physical local files when YouTube no longer contains their episode.
+
+        This only repairs the local uploaded-history filter. It never deletes files and
+        never clears a hard slot/video_id checkpoint.
+        """
+        names = {str(x) for x in filenames if str(x)}
+        if not names:
+            return []
+        with self._save_lock:
+            old = list(self.uploaded.get(ch_id, []))
+            removed = [x for x in old if x in names]
+            if removed:
+                self.uploaded[ch_id] = [x for x in old if x not in names]
+                self.save()
+            return removed
 
     def set_channel_status(self, ch_id: str, status: str, count: int | None = None):
         with self._save_lock:
@@ -1469,6 +1668,10 @@ class App(ctk.CTk):
             fg_color="#8b1e1e", hover_color="#6d1616", command=self.cancel_job,
         )
         self.btn_cancel.pack(side="left", padx=3)
+        ctk.CTkButton(
+            row2, text="Check thiếu tập", height=36, width=116,
+            fg_color="#5b4b8a", command=self.on_check_episode_gaps,
+        ).pack(side="left", padx=3)
         self.status_lbl = ctk.CTkLabel(row2, text="Sẵn sàng")
         self.status_lbl.pack(side="left", padx=8)
 
@@ -2179,6 +2382,12 @@ class App(ctk.CTk):
         self._ui_cid = cid
         ch = self.store.cfg["channels"].get(cid, {})
         self.folder_var.set(ch.get("folder", ""))
+        # v1.0.31: delete-local is channel-owned; UI only edits the selected channel.
+        if hasattr(self, "auto_del_local"):
+            if bool(ch.get("auto_delete_local", self.store.cfg.get("auto_delete_local", False))):
+                self.auto_del_local.select()
+            else:
+                self.auto_del_local.deselect()
         # lịch riêng từng kênh
         self._write_slots(ch.get("schedule_slots") or [])
         # v1.0.11: Auto Daily là công tắc HÀNG LOẠT, không đổi theo kênh đang chọn.
@@ -2263,6 +2472,85 @@ class App(ctk.CTk):
             self.store.cfg["channels"][cid]["folder"] = d
             self.store.save()
         self.on_scan()
+
+    def _youtube_inventory(self, cid: str) -> list[dict]:
+        ch = (self.store.cfg.get("channels") or {}).get(cid, {})
+        token = str(ch.get("token_file") or "")
+        if not token or not Path(token).exists():
+            raise RuntimeError("Kênh chưa OAuth hoặc token không còn tồn tại.")
+        return youtube_channel_inventory(youtube_from_token(token))
+
+    def _next_empty_schedule_day(self, occupied: set[str], start_date=None) -> str:
+        day = start_date or (datetime.now().date() + timedelta(days=1))
+        for _ in range(366):
+            key = day.strftime("%Y-%m-%d")
+            if key not in occupied:
+                return key
+            day += timedelta(days=1)
+        return ""
+
+    def on_check_episode_gaps(self):
+        """Compare episode numbers on YouTube with the selected channel folder."""
+        cid = self.current_channel_id()
+        if not cid:
+            messagebox.showinfo("Check thiếu tập", "Chưa chọn kênh.")
+            return
+        self._apply_ui_to_store(silent=True)
+        ch = (self.store.cfg.get("channels") or {}).get(cid, {})
+        self._log_ui(f"🔎 Đang check thiếu tập [{ch.get('title', cid)}]…")
+
+        def work():
+            try:
+                rows = self._youtube_inventory(cid)
+                yt_eps = {n for n in (extract_episode_text(r.get("title", "")) for r in rows) if n is not None}
+                folder = Path(ch.get("folder") or "")
+                local_map: dict[int, str] = {}
+                if folder.is_dir():
+                    for fp in folder.iterdir():
+                        if fp.is_file() and fp.suffix.lower() in VIDEO_EXTS:
+                            ep = extract_episode(fp)
+                            if ep is not None:
+                                local_map.setdefault(ep, fp.name)
+                local_eps = set(local_map)
+                all_eps = yt_eps | local_eps
+                max_ep = max(all_eps) if all_eps else 0
+                missing_yt = [n for n in range(1, max_ep + 1) if n not in yt_eps]
+                ready_local = [n for n in missing_yt if n in local_eps]
+                missing_both = [n for n in missing_yt if n not in local_eps]
+
+                # v1.0.35: physical folder is the source of truth for local presence.
+                # A previous failed/deleted upload may have left the filename in uploaded.json,
+                # which made pending_files() hide a real file. If YouTube is missing that
+                # episode and the physical video still exists, remove ONLY that stale history
+                # marker so the episode returns to the queue. Hard slot/video_id checkpoints
+                # are deliberately untouched here.
+                used_now = self.store.used_names(cid)
+                stale_history_files = [local_map[n] for n in ready_local if local_map.get(n) in used_now]
+                requeued = self.store.forget_used_many(cid, stale_history_files)
+
+                scheduled = sum(1 for r in rows if r.get("publish_at"))
+                processing = sum(1 for r in rows if str(r.get("processing") or "").lower() not in ("", "succeeded"))
+                def compact(nums):
+                    return ", ".join(f"Tập {x}" for x in nums[:60]) + (" …" if len(nums) > 60 else "") or "Không có"
+                msg = (
+                    f"Kênh: {ch.get('title', cid)}\n"
+                    f"YouTube nhận diện: {len(yt_eps)} tập · local: {len(local_eps)} tập\n"
+                    f"Đã hẹn lịch: {scheduled} · đang xử lý: {processing}\n\n"
+                    f"Thiếu trên YouTube nhưng CÓ file local:\n{compact(ready_local)}\n\n"
+                    f"Thiếu cả YouTube lẫn folder:\n{compact(missing_both)}"
+                    + (f"\n\nĐã sửa history cũ và đưa lại hàng chờ: {', '.join(requeued)}" if requeued else "")
+                )
+                self.after(0, lambda m=msg: messagebox.showinfo("Kết quả check thiếu tập", m))
+                if requeued:
+                    self.after(0, self.on_scan)
+                self.after(0, lambda: self._log_ui(
+                    f"✓ Check tập [{ch.get('title', cid)}]: thiếu YT {len(missing_yt)}, "
+                    f"có local {len(ready_local)}, thiếu cả hai {len(missing_both)}"
+                ))
+            except Exception as e:
+                self.after(0, lambda err=str(e): messagebox.showerror("Check thiếu tập", err))
+                self.after(0, lambda err=str(e): self._log_ui(f"⚠ Check thiếu tập lỗi: {err}"))
+        threading.Thread(target=work, daemon=True).start()
 
     def pending_files(self, cid: str | None = None) -> list[Path]:
         cid = cid or self.current_channel_id()
@@ -2359,11 +2647,15 @@ class App(ctk.CTk):
                 self._log_ui(f"Không xóa thumb {th.name}: {e}")
         return gone_v, gone_t
 
-    def _maybe_delete_after_up(self, pick: Path):
-        on = False
-        if hasattr(self, "auto_del_local"):
-            on = bool(self.auto_del_local.get())
-        on = on or bool(self.store.cfg.get("auto_delete_local"))
+    def _maybe_delete_after_up(self, cid: str, pick: Path):
+        """Delete local media using ONLY the owning channel's saved setting.
+
+        Background workers must never read the checkbox of the channel currently
+        displayed in the UI; doing so can make channel A inherit channel B's
+        delete policy while A is still uploading in the background.
+        """
+        ch = (self.store.cfg.get("channels") or {}).get(cid) or {}
+        on = bool(ch.get("auto_delete_local", self.store.cfg.get("auto_delete_local", False)))
         if not on:
             return
         gv, gt = self._wipe_local_media(pick)
@@ -2493,7 +2785,7 @@ class App(ctk.CTk):
     def _parse_slot_lines(self) -> list[str]:
         raw = self.slot_box.get("1.0", "end").strip()
         lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        return self._daily_times_from_lines(lines)
+        return self._daily_times_from_lines(lines)[:10]
 
     def _used_slot_set(self, cid: str | None = None) -> set[str]:
         used = set()
@@ -2533,33 +2825,54 @@ class App(ctk.CTk):
         self._save_used_slots(kept, cid)
 
     def _reset_used_slots(self):
+        """Release ONLY stale reservations that never received a YouTube video_id.
+
+        v1.0.30 HARD SLOT LOCK: a slot already committed in used_publish_slots, or an
+        inflight row that already has a video_id, is a hard lock.  Clearing locks must
+        never make those publishAt values available again, otherwise pre-upload can
+        schedule a second video into the same channel/date/time.
+        """
         if not messagebox.askyesno(
             "Xóa mốc đã khóa",
-            "Xóa mọi giờ đã khóa của kênh này?\n"
-            "Dùng khi đổi 13:00/14:00 sang 08:00/18:45/21:00 mà Studio vẫn ra giờ cũ.",
+            "Chỉ giải phóng các mốc bị kẹt CHƯA tạo video trên YouTube.\n"
+            "Các mốc đã có video / đã hẹn lịch sẽ được giữ để tránh đăng trùng. Tiếp tục?",
         ):
             return
         cid = self.current_channel_id()
-        self.store.cfg["used_publish_slots"] = []
-        self.store.cfg.pop("_slot_in_use", None)
-        if cid and cid in self.store.cfg.get("channels", {}):
-            self.store.cfg["channels"][cid]["used_publish_slots"] = []
-            # v1.0.17: "Xóa mốc đã khóa" cũng phải giải phóng reservation dở
-            # của chính kênh này. Trước đây inflight_uploads vẫn giữ slot nên
-            # _slots_today_remaining() tiếp tục coi 18:45/21:00 là đã khóa.
-            # Chỉ xóa checkpoint CHƯA có video_id; checkpoint đã nhận video_id
-            # được giữ lại để recovery xác minh, tránh upload trùng.
-            if not self._busy_map.get(cid, False):
-                root = self.store.cfg.get("inflight_uploads") or {}
-                rows = root.get(cid) if isinstance(root, dict) else None
-                if isinstance(rows, dict):
-                    for fname, row in list(rows.items()):
-                        if not isinstance(row, dict) or not str(row.get("video_id") or "").strip():
-                            rows.pop(fname, None)
-        self.store.save()
+        if not cid or cid not in self.store.cfg.get("channels", {}):
+            return
+
+        released = 0
+        protected = len(self._used_slot_set(cid))
+        with self._cfg_lock:
+            # IMPORTANT: never clear used_publish_slots here. Those are committed
+            # publishAt slots and must remain occupied even after pre-upload.
+            root = self.store.cfg.get("inflight_uploads") or {}
+            rows = root.get(cid) if isinstance(root, dict) else None
+            if isinstance(rows, dict) and not self._busy_map.get(cid, False):
+                for fname, row in list(rows.items()):
+                    if not isinstance(row, dict):
+                        rows.pop(fname, None)
+                        released += 1
+                        continue
+                    vid = str(row.get("video_id") or "").strip()
+                    if vid:
+                        # video exists/was accepted by YouTube: hard-lock its slot.
+                        protected += 1
+                        continue
+                    rows.pop(fname, None)
+                    released += 1
+                if not rows:
+                    root.pop(cid, None)
+            self.store.cfg.pop("_slot_in_use", None)  # legacy global only
+            self.store.save()
+
         self._refresh_slot_preview()
-        left = self._slots_today_remaining(cid) if cid else []
-        self._log_ui("Đã xóa mốc khóa. Mốc còn hôm nay: " + (", ".join(left) if left else "không còn mốc tương lai"))
+        left = self._slots_preload_window(cid, 24)
+        self._log_ui(
+            f"Đã giải phóng {released} mốc kẹt chưa có video; giữ {protected} mốc đã có/đã hẹn. "
+            + ("Mốc preload còn: " + ", ".join(left) if left else "Không còn mốc preload trống trong 24h.")
+        )
 
     def _slots_today_remaining(self, cid: str | None = None) -> list[str]:
         """Chỉ mốc HÔM NAY còn trong tương lai. Giờ đã qua → bỏ, chờ ngày mai."""
@@ -2585,6 +2898,46 @@ class App(ctk.CTk):
             out.append(key)
         return out
 
+    def _slots_preload_window(self, cid: str, hours_ahead: int = 24) -> list[str]:
+        """Các mốc chưa dùng sẽ tới trong cửa sổ preload.
+
+        Auto Daily dùng cửa sổ 24h: ví dụ mốc 18:45 ngày mai sẽ bắt đầu
+        upload từ khoảng 18:45 hôm nay. Video vẫn private/scheduled và chỉ
+        public đúng publishAt. Không phụ thuộc kênh đang chọn trên UI.
+        """
+        ch = (self.store.cfg.get("channels") or {}).get(cid, {})
+        daily = self._daily_times_from_lines(ch.get("schedule_slots") or [])
+        if not daily:
+            return []
+        used = self._used_slot_set(cid) | self._reserved_slot_set(cid)
+        now = datetime.now() + timedelta(minutes=1)
+        horizon = datetime.now() + timedelta(hours=max(1, int(hours_ahead)))
+        start_day = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        force_date = str(getattr(self, "_schedule_force_date", {}).get(cid, "") or "")
+        out: list[str] = []
+        # Auto: 24h. Manual "đổi ngày" may explicitly force the next empty date.
+        days = [start_day + timedelta(days=d) for d in range(0, 3)]
+        if force_date:
+            try:
+                forced = datetime.strptime(force_date, "%Y-%m-%d")
+                days = [forced]
+                horizon = forced.replace(hour=23, minute=59, second=59)
+            except Exception:
+                pass
+        for day in days:
+            for hhmm in daily:
+                hh, mm = hhmm.split(":")
+                cand = day.replace(hour=int(hh), minute=int(mm))
+                if cand <= now or cand > horizon:
+                    continue
+                key = cand.strftime("%Y-%m-%d %H:%M")
+                skip_dates = set(getattr(self, "_schedule_skip_dates", {}).get(cid, set()))
+                if cand.strftime("%Y-%m-%d") in skip_dates:
+                    continue
+                if key not in used:
+                    out.append(key)
+        return sorted(out)
+
     def _next_repeating_slots(self, daily: list[str], count: int = 6, cid: str | None = None) -> list[str]:
         """Sinh mốc datetime tiếp theo: lặp giờ mỗi ngày, bỏ mốc đã dùng / đã qua."""
         daily = self._daily_times_from_lines(daily)
@@ -2603,7 +2956,12 @@ class App(ctk.CTk):
                 if cand <= cut:
                     continue
                 key = cand.strftime("%Y-%m-%d %H:%M")
-                if key in used:
+                skip_dates = set(getattr(self, "_schedule_skip_dates", {}).get(cid, set()))
+                force_date = str(getattr(self, "_schedule_force_date", {}).get(cid, "") or "")
+                day_key = cand.strftime("%Y-%m-%d")
+                if force_date and day_key != force_date:
+                    continue
+                if day_key in skip_dates or key in used:
                     continue
                 out.append(key)
                 if len(out) >= count:
@@ -2615,7 +2973,7 @@ class App(ctk.CTk):
             return
         daily = self._parse_slot_lines()
         nxt = self._next_repeating_slots(daily, 6, self.current_channel_id())
-        used_n = len(self._used_slot_set())
+        used_n = len(self._used_slot_set(self.current_channel_id()))
         if not daily:
             self.next_preview.configure(text="Chưa có giờ lặp. Ví dụ mỗi dòng: 12:00")
             return
@@ -2801,19 +3159,21 @@ class App(ctk.CTk):
                     self.start_job_for(cid, n_retry, parallel=n_retry > 1, skip_today_warn=True)
                 # Whether files are present or temporarily missing, never skip ahead.
                 continue
-            if (not crossed_midnight) and ch.get("auto_day_done") == today:
+            # v1.0.28: PRE-UPLOAD 24H. Không dùng auto_day_done để chặn cả ngày,
+            # vì từng mốc ngày mai chỉ trở nên đủ điều kiện khi đi vào cửa sổ 24h.
+            # Ví dụ 21:00 ngày mai được upload từ ~21:00 hôm nay.
+            pending = self.pending_files(cid)
+            if not pending:
                 continue
-            if not self.pending_files(cid):
-                continue
-            left = self._slots_today_remaining(cid)
+            left = self._slots_preload_window(cid, 24)
             if not left:
-                self._mark_auto_day(cid)
                 continue
-            n = min(len(left), len(self.pending_files(cid)))
+            n = min(len(left), len(pending))
             if n <= 0:
                 continue
             self._log_ui(
-                f"☀ Auto [{ch.get('title')}]: {n} video — {', '.join(left[:n])}"
+                f"⏩ Preload 24h [{ch.get('title')}]: {n} video — "
+                + ", ".join(left[:n])
             )
             self.start_job_for(cid, n, parallel=n > 1, skip_today_warn=True)
 
@@ -2880,6 +3240,7 @@ class App(ctk.CTk):
                 "public_now": self.store.cfg.get("public_now", False),
                 "premiere_on": self.store.cfg.get("premiere_on", True),
                 "auto_thumb": self.store.cfg.get("auto_thumb", True),
+                "auto_delete_local": bool(self.auto_del_local.get()) if hasattr(self, "auto_del_local") else old.get("auto_delete_local", self.store.cfg.get("auto_delete_local", False)),
                 "overlay_thumb_text": self.store.cfg.get("overlay_thumb_text", True),
                 "series_priority": self.store.cfg.get("series_priority", True),
                 "playlist_enabled": self.store.cfg.get("playlist_enabled", True),
@@ -3073,8 +3434,32 @@ class App(ctk.CTk):
                         exists = True
                         recovery_method = "exact_title_time"
                 if exists:
+                    proc = get_video_processing(youtube, vid)
+                    proc_status = proc.get("status", "unknown")
+                    if proc_status != "succeeded":
+                        # A real video exists but processing is not confirmed. Keep checkpoint and
+                        # do NOT mark used, do NOT release the slot, do NOT re-upload.
+                        self._log_ui(
+                            f"⏳ Recovery: {fname} đã có video_id {vid} nhưng processing={proc_status}. "
+                            "Giữ checkpoint, không upload trùng."
+                        )
+                        continue
                     folder = ch.get("folder") or ""
                     pick = Path(folder) / fname if folder else Path(fname)
+                    # v1.0.30: a recovered video is not DONE until required thumb is accepted too.
+                    try:
+                        ten = story_name_from_file(pick)
+                        th_done = ensure_required_thumbnail(youtube, vid, pick, ch, self.store.cfg, ten)
+                        if th_done:
+                            self._log_ui(f"🖼 Recovery THUMB READY: {fname} -> {th_done.name}")
+                    except ThumbnailRequiredError as te:
+                        row["video_id"] = vid
+                        row["state"] = "thumbnail_pending"
+                        row["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        rows[fname] = row
+                        self.store.save()
+                        self._log_ui(f"⏳ Recovery: VIDEO READY nhưng THUMB chưa READY cho {fname}: {te}")
+                        continue
                     with self._cfg_lock:
                         self.store.mark_used(cid, fname)
                     self._commit_upload_checkpoint(cid, pick, slot or None)
@@ -3132,13 +3517,34 @@ class App(ctk.CTk):
             )
         cid = self.current_channel_id()
         if not left:
-            messagebox.showinfo(
+            # v1.0.34: Manual mode must not dead-end when today's slots are full.
+            # Offer the next repeating date, then let start_job verify YouTube's
+            # remote inventory and move again if that date is already occupied.
+            if not cid:
+                return
+            pending = self.pending_files(cid)
+            if not pending:
+                messagebox.showinfo("Không up lại", "Không còn file CHƯA ĐĂNG trong thư mục kênh này.")
+                return
+            next_slots = self._next_repeating_slots(times, min(10, len(pending)), cid)
+            if not next_slots:
+                messagebox.showinfo("Hết mốc", "Không tìm thấy mốc giờ tiếp theo để lên lịch.")
+                return
+            next_date = next_slots[0][:10]
+            same_day = [x for x in next_slots if x.startswith(next_date + " ")][:10]
+            msg_slots = ", ".join(x[11:] for x in same_day)
+            ok = messagebox.askyesno(
                 "Hết giờ hôm nay",
-                "Mọi mốc của kênh này hôm nay đã qua hoặc đã khóa.\n"
-                "Không up bù. Ngày mai tool lặp lại đúng các giờ.",
+                f"Mọi mốc hôm nay đã qua hoặc đã khóa.\n\n"
+                f"Chuyển sang ngày {next_date} với các mốc {msg_slots}?\n"
+                "Tool sẽ kiểm tra lịch YouTube trước để tránh trùng video.",
             )
-            if cid:
-                self._mark_auto_day(cid)
+            if not ok:
+                self._log_ui("⏸ Bạn chọn không chuyển sang ngày tiếp theo.")
+                return
+            n = min(len(same_day), len(pending), 10)
+            self._log_ui(f"↪ Manual: chuyển sang {next_date}, chuẩn bị {n} video.")
+            self.start_job(n, parallel=n > 1, force_schedule_date=next_date)
             return
         pending = self.pending_files(cid) if cid else []
         if not pending:
@@ -3156,7 +3562,7 @@ class App(ctk.CTk):
         )
         self.start_job(n, parallel=n > 1)
 
-    def start_job(self, max_n: int, skip_today_warn: bool = False, parallel: bool = False, force_cid: str | None = None):
+    def start_job(self, max_n: int, skip_today_warn: bool = False, parallel: bool = False, force_cid: str | None = None, force_schedule_date: str | None = None):
         if not self._licensed:
             messagebox.showerror("License", "Chưa kích hoạt key.")
             return
@@ -3217,6 +3623,57 @@ class App(ctk.CTk):
                 self._token_warned.add(cid)
                 messagebox.showerror("Token", msg)
             return
+        # v1.0.32: check remote schedule only when this job would touch tomorrow.
+        # This avoids wasting YouTube API quota for public-now or today-only jobs.
+        self._schedule_skip_dates = getattr(self, "_schedule_skip_dates", {})
+        self._schedule_force_date = getattr(self, "_schedule_force_date", {})
+        self._schedule_skip_dates[cid] = set()
+        self._schedule_force_date[cid] = str(force_schedule_date or "")
+        tomorrow = (datetime.now().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+        daily = self._daily_times_from_lines(ch.get("schedule_slots") or [])
+        scheduled_mode = bool(ch.get("schedule_enabled", self.store.cfg.get("schedule_enabled", True))) and not bool(
+            ch.get("public_now", self.store.cfg.get("public_now", False))
+        )
+        planned_probe = self._next_repeating_slots(daily, max(1, max_n), cid) if (daily and scheduled_mode) else []
+        probe_date = str(force_schedule_date or tomorrow)
+        touches_tomorrow = bool(force_schedule_date) or any(x.startswith(tomorrow + " ") for x in planned_probe)
+        if touches_tomorrow:
+            try:
+                inv = youtube_channel_inventory(youtube_from_token(ch["token_file"]))
+                occupied = youtube_inventory_dates(inv, self.store.cfg.get("timezone", "Asia/Ho_Chi_Minh"))
+                if probe_date in occupied:
+                    try:
+                        empty_start = datetime.strptime(probe_date, "%Y-%m-%d").date() + timedelta(days=1)
+                    except Exception:
+                        empty_start = datetime.now().date() + timedelta(days=1)
+                    empty = self._next_empty_schedule_day(occupied, empty_start)
+                    if force_cid:
+                        self._schedule_skip_dates[cid] = set(occupied)
+                        self._log_ui(
+                            f"↪ Auto [{ch.get('title', cid)}]: ngày {probe_date} đã có video hẹn lịch; "
+                            f"bỏ ngày đã có video, ngày trống kế tiếp: {empty or 'không tìm thấy'}."
+                        )
+                    else:
+                        ok = messagebox.askyesno(
+                            "Ngày tiếp theo đã có video",
+                            f"Ngày {probe_date} trên kênh này đã có video hẹn lịch.\n\n"
+                            f"Bạn có muốn bỏ ngày đó và chuyển sang ngày trống tiếp theo {empty or '?'} không?\n"
+                            "Có = chuyển ngày · Không = dừng để kiểm tra lịch.",
+                        )
+                        if not ok:
+                            self._log_ui(f"⏸ Dừng: ngày {probe_date} đã có video trên YouTube.")
+                            return
+                        self._schedule_skip_dates[cid] = set(occupied)
+                        self._schedule_force_date[cid] = empty
+                        self._log_ui(f"↪ Đã chọn chuyển lịch sang ngày trống {empty}.")
+            except Exception as inv_err:
+                # Never guess remote occupancy. Auto waits; manual mode shows one error.
+                if force_cid:
+                    self._log_ui(f"⏸ Auto [{ch.get('title', cid)}]: chưa check được lịch YouTube: {inv_err}")
+                    return
+                messagebox.showerror("Check lịch YouTube", f"Chưa kiểm tra được lịch trên kênh:\n{inv_err}")
+                return
+
         picks = self._pick_n_files(cid, max_n)
         bad = [p.name for p in picks if (not p.exists()) or p.stat().st_size < 10_000]
         if bad:
@@ -3232,23 +3689,14 @@ class App(ctk.CTk):
         if ch.get("auto_thumb", self.store.cfg.get("auto_thumb", True)):
             miss = [p.name for p in picks if not find_thumb_for_video(p)]
             if miss:
+                # Auto Thumb ON means thumbnail is mandatory. Blocking BEFORE upload
+                # avoids creating a YouTube video that can never reach DONE locally.
+                msg = "Thiếu thumb bắt buộc: " + ", ".join(miss[:8])
                 if force_cid:
-                    # Same behaviour as choosing "Có" manually, but without a
-                    # modal dialog that would make one auto channel appear paused.
-                    self._log_ui(
-                        f"⚠ Auto [{ch.get('title', cid)}]: thiếu thumb cho "
-                        + ", ".join(miss[:8]) + " — tiếp tục không thumb."
-                    )
+                    self._log_ui(f"⏸ Auto [{ch.get('title', cid)}]: {msg} — chưa upload.")
                 else:
-                    ok = messagebox.askyesno(
-                        "Thiếu thumb",
-                        "Các file chưa có ảnh thumb cùng tên:\n"
-                        + "\n".join(miss[:8])
-                        + ("\n…" if len(miss) > 8 else "")
-                        + "\n\nVẫn up không thumb?",
-                    )
-                    if not ok:
-                        return
+                    messagebox.showerror("Thiếu thumb", msg + "\n\nThêm ảnh cùng tên hoặc tắt Auto Thumb rồi chạy lại.")
+                return
         # v1.0.19: lịch sử chống trùng phải tách theo channel_id.
         # Hai kênh khác nhau được phép dùng cùng tiêu đề mà không cảnh báo nhầm.
         titles_hist = {
@@ -3331,8 +3779,10 @@ class App(ctk.CTk):
                 return []
             # v1.0.20: không ghi lịch channel vào config global; worker A/B có thể chạy đồng thời.
             self._prune_used_to_clocks(daily, cid)
-            # chỉ khóa giờ còn lại HÔM NAY của kênh này
-            slots = self._slots_today_remaining(cid)[:n]
+            # v1.0.32: parallel Auto Daily/preload phải khóa đúng cửa sổ 24h,
+            # không chỉ các mốc còn lại của hôm nay. Nhờ vậy batch qua nửa đêm
+            # vẫn nhận đủ slot ngày mai và không báo sai "không đủ mốc".
+            slots = self._slots_preload_window(cid, 24)[:n]
             # không trùng trong lô
             uniq: list[str] = []
             seen: set[str] = set()
@@ -3455,20 +3905,24 @@ class App(ctk.CTk):
             )
             vid = resp.get("id", "?")
             self._checkpoint_set_video_id(cid, pick, vid)
-            if ch.get("auto_thumb", self.store.cfg.get("auto_thumb", True)):
-                th = find_thumb_for_video(pick)
-                if th:
-                    try:
-                        upload_img = th
-                        if ch.get("overlay_thumb_text", self.store.cfg.get("overlay_thumb_text", True)):
-                            upload_img = overlay_story_on_thumb(th, ten, THUMB_TMP)
-                        set_thumbnail(youtube, vid, upload_img)
-                    except Exception as te:
-                        self.after(0, lambda err=str(te): self._log_ui(f"  ⚠ thumb: {err}"))
+            wait_video_processing(
+                youtube, vid,
+                should_cancel=lambda: self._want_cancel(cid),
+                on_state=lambda st, rs: self.after(0, lambda st=st, rs=rs: self._log_ui(
+                    f"  YouTube processing: {st}" + (f" ({rs})" if rs else "")
+                )),
+            )
+            # v1.0.30: Auto Thumb ON => thumbnail must be accepted before DONE.
+            self._checkpoint_upload(cid, pick, slot, title, state="thumbnail_pending", video_id=vid)
+            th_done = ensure_required_thumbnail(youtube, vid, pick, ch, self.store.cfg, ten)
+            if th_done:
+                self.after(0, lambda n=th_done.name: self._log_ui(f"  ✓ THUMB READY: {n}"))
+            else:
+                self.after(0, lambda: self._log_ui("  ✓ THUMB: bỏ qua (Auto Thumb tắt)"))
             with self._cfg_lock:
                 self.store.mark_used(cid, pick.name)
                 self.store.set_channel_status(cid, "green", len(self.store.used_names(cid)))
-            self._maybe_delete_after_up(pick)
+            self._maybe_delete_after_up(cid, pick)
             self._commit_upload_checkpoint(cid, pick, slot)
             self.after(0, lambda v=vid, n=pick.name: self._log_ui(
                 f"✓ OK youtube.com/watch?v={v}  ({n})"
@@ -3527,10 +3981,18 @@ class App(ctk.CTk):
                     pass
             with self._cfg_lock:
                 done_holder["n"] = done_holder.get("n", 0) + 1
+        except VideoProcessingPending as e:
+            # Keep video_id + inflight checkpoint. Never advance/re-upload this episode.
+            self.after(0, lambda err=str(e): self._log_ui(f"⏳ {pick.name}: {err}"))
         except JobCancelled:
-            self._release_upload_checkpoint(cid, pick.name)
+            # If YouTube already returned a video_id, preserve checkpoint to avoid duplicates.
+            row = self._inflight_entries(cid).get(pick.name) or {}
+            if not row.get("video_id"):
+                self._release_upload_checkpoint(cid, pick.name)
         except Exception as e:
-            self._release_upload_checkpoint(cid, pick.name)
+            row = self._inflight_entries(cid).get(pick.name) or {}
+            if not row.get("video_id"):
+                self._release_upload_checkpoint(cid, pick.name)
             self.after(0, lambda err=classify_yt_error(e): self._log_ui(f"✗ Lỗi {pick.name}: {err}"))
 
     def _job(self, cid: str, max_n: int):
@@ -3617,22 +4079,22 @@ class App(ctk.CTk):
                     )
                     vid = resp.get("id", "?")
                     self._checkpoint_set_video_id(cid, pick, vid)
-                    if ch.get("auto_thumb", self.store.cfg.get("auto_thumb", True)):
-                        th = find_thumb_for_video(pick)
-                        if th:
-                            try:
-                                upload_img = th
-                                if ch.get("overlay_thumb_text", self.store.cfg.get("overlay_thumb_text", True)):
-                                    upload_img = overlay_story_on_thumb(th, ten, THUMB_TMP)
-                                    self.after(0, lambda: self._log_ui("  đã đè chữ tên video lên thumb"))
-                                set_thumbnail(youtube, vid, upload_img)
-                                self.after(0, lambda n=th.name: self._log_ui(f"  ✓ gắn thumb {n}"))
-                            except Exception as te:
-                                self.after(0, lambda err=str(te): self._log_ui(f"  ⚠ gắn thumb lỗi: {err}"))
-                        else:
-                            self.after(0, lambda: self._log_ui("  ⚠ không thấy file thumb cùng tên"))
+                    wait_video_processing(
+                        youtube, vid,
+                        should_cancel=lambda: self._want_cancel(cid),
+                        on_state=lambda st, rs: self.after(0, lambda st=st, rs=rs: self._log_ui(
+                            f"  YouTube processing: {st}" + (f" ({rs})" if rs else "")
+                        )),
+                    )
+                    # v1.0.30: VIDEO READY + THUMB READY are both required before DONE.
+                    self._checkpoint_upload(cid, pick, current_slot, title, state="thumbnail_pending", video_id=vid)
+                    th_done = ensure_required_thumbnail(youtube, vid, pick, ch, self.store.cfg, ten)
+                    if th_done:
+                        self.after(0, lambda n=th_done.name: self._log_ui(f"  ✓ THUMB READY: {n}"))
+                    else:
+                        self.after(0, lambda: self._log_ui("  ✓ THUMB: bỏ qua (Auto Thumb tắt)"))
                     self.store.mark_used(cid, pick.name)
-                    self._maybe_delete_after_up(pick)
+                    self._maybe_delete_after_up(cid, pick)
                     committed_slot = current_slot
                     self._commit_upload_checkpoint(cid, pick, committed_slot)
                     self.after(0, lambda v=vid, n=pick.name: self._log_ui(f"✓ OK youtube.com/watch?v={v}  ({n})"))
@@ -3714,12 +4176,21 @@ class App(ctk.CTk):
                     else:
                         self._clear_pending_job(cid)
                     self.after(0, self.on_scan)
+                except VideoProcessingPending as e:
+                    # Keep checkpoint with video_id and stop this channel. Do not advance to next file.
+                    self.after(0, lambda err=str(e): self._log_ui(f"⏳ {pick.name}: {err}"))
+                    self._persist_pending_job(cid, max_n - done)
+                    break
                 except JobCancelled:
-                    self._release_upload_checkpoint(cid, pick.name)
+                    row = self._inflight_entries(cid).get(pick.name) or {}
+                    if not row.get("video_id"):
+                        self._release_upload_checkpoint(cid, pick.name)
                     self.after(0, lambda: self._log_ui("⏹ Đã hủy giữa lúc upload. Video chưa được tính là đã đăng."))
                     break
                 except Exception as e:
-                    self._release_upload_checkpoint(cid, pick.name)
+                    row = self._inflight_entries(cid).get(pick.name) or {}
+                    if not row.get("video_id"):
+                        self._release_upload_checkpoint(cid, pick.name)
                     self.after(0, lambda err=str(e): self._log_ui(f"✗ Lỗi upload {pick.name}: {err}"))
                     # v1.0.6: upload lỗi KHÔNG tăng done, KHÔNG trừ pending_job.
                     # Dừng lô để tránh vòng lặp vô hạn trên chính file lỗi; bấm Tiếp tục để thử lại.
